@@ -1,0 +1,77 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Unit test / coverage reports
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.coverage.*
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+*.out
+*.err
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Docker
+**/Dockerfile*
+docker-compose.override.yml
+.docker/
+.dockerignore
+
+# Redis / Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Database
+*.db
+*.sqlite3
+pgdata/
+
+# Temporary files
+tmp/
+*.tmp
+*.bak
+*.orig
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python cache
+*.pyo
+*.pyd
