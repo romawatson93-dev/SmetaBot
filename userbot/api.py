@@ -1,11 +1,11 @@
 # /app/api.py
 import os
-import re
 import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from pyrogram import Client, filters
+from pyrogram import Client
 from pyrogram.errors import RPCError
+from pyrogram.types import ChatPrivileges  # <-- важное добавление
 
 # ===== ЛОГИ =====
 logging.basicConfig(
@@ -34,9 +34,6 @@ SESSION_DIR = "/sessions"
 # PROXY = build_proxy(os.getenv("TG_PROXY_URL"))
 PROXY = None
 
-# ваш числовой id подхватим на старте
-MY_ID: int | None = None
-
 pyro = Client(
     SESSION_NAME,
     api_id=API_ID,
@@ -47,12 +44,11 @@ pyro = Client(
 
 app = FastAPI(title="Userbot API")
 
-# ===== ХУКИ СТАРТА/ОСТАНОВА =====
+# ===== СТАРТ/СТОП =====
 @app.on_event("startup")
 async def _startup():
     await pyro.start()
-
-    # 🔥 Прогреваем кэш пиров, чтобы не было 'Peer id invalid'
+    # прогрев кэша диалогов (фикс 'Peer id invalid')
     try:
         async for _ in pyro.get_dialogs(limit=100):
             pass
@@ -61,15 +57,8 @@ async def _startup():
         log.warning("dialogs warm-up failed: %s", e)
 
     me = await pyro.get_me()
-
-    # ⬇️ запомним ваш числовой user id (например, 370759938)
-    global MY_ID
-    MY_ID = me.id
-
     if getattr(me, "is_bot", False):
-        raise RuntimeError(
-            "Userbot залогинен как БОТ. Удалите /sessions/*.session и залогиньтесь телефоном."
-        )
+        raise RuntimeError("Userbot залогинен как БОТ. Удалите /sessions/*.session и залогиньтесь телефоном.")
     log.info("pyrogram started as %s (%s)", me.username, me.id)
 
 @app.on_event("shutdown")
@@ -77,18 +66,16 @@ async def _shutdown():
     await pyro.stop()
     log.info("pyrogram stopped")
 
-# ===== УТИЛИТЫ =====
-def _is_me(msg) -> bool:
-    """
-    Считаем сообщение «моим», если оно исходящее (outgoing=True)
-    ИЛИ явно от моего user_id.
-    """
-    return bool(
-        getattr(msg, "outgoing", False)
-        or (getattr(msg, "from_user", None) and msg.from_user.id == MY_ID)
-    )
+# ===== МОДЕЛИ =====
+class CreateRoomReq(BaseModel):
+    title: str
+    bot_username: str  # например "@OrbitSend_bot"
 
-# ===== СЕРВИСНЫЕ ЭНДПОИНТЫ =====
+class CreateRoomResp(BaseModel):
+    chat_id: int
+    title: str
+
+# ===== ЭНДПОИНТЫ =====
 @app.get("/health")
 async def health():
     me = await pyro.get_me()
@@ -100,67 +87,46 @@ async def selftest():
     await pyro.send_message("me", "✅ Userbot online")
     return {"ok": True, "user_id": me.id}
 
-# ===== ДИАГНОСТИКА АПДЕЙТОВ (временный логгер) =====
-@pyro.on_message(filters.text)
-async def _dbg_me(client, message):
-    # логируем КАЖДОЕ текстовое сообщение и помечаем, «моё» ли оно
-    log.info(
-        "TXT chat=%s from=%s outgoing=%s is_me=%s text=%r",
-        getattr(message.chat, "id", None),
-        getattr(getattr(message, "from_user", None), "id", None),
-        getattr(message, "outgoing", None),
-        _is_me(message),
-        message.text,
-    )
-
-# ===== ПИНГ-ХЕНДЛЕР (со слэшем и без; ru/en) =====
-@pyro.on_message(
-    filters.text & filters.regex(r"^/?(?:ping|pong|пинг|понг)$", flags=re.IGNORECASE)
-)
-async def ping_me(client, message):
-    if not _is_me(message):
-        return
-    log.info("PING matched text=%r chat=%s", message.text, getattr(message.chat, "id", None))
-    await message.reply_text("pong")
-
-# ===== МИНИ-API: создание канала + защита + добавить бота админом =====
-class CreateRoomReq(BaseModel):
-    title: str
-    bot_username: str  # например "@YourBot"
-
-class CreateRoomResp(BaseModel):
-    chat_id: int
-    title: str
-
 @app.post("/create_room", response_model=CreateRoomResp)
 async def create_room(req: CreateRoomReq):
+    """
+    1) создаём приватный канал
+    2) включаем защиту контента (restrict saving)
+    3) бота сразу назначаем администратором (без приглашения участником)
+    """
     try:
+        # 1) создать канал
         chat = await pyro.create_channel(req.title, description="Личная комната клиента")
         chat_id = chat.id
 
-        # Включить protected content (если доступно в вашей версии клиента/аккаунта)
+        # 2) защитить контент (если метод доступен)
         try:
-            # в разных версиях может называться по-разному — ловим любые ошибки
             await pyro.set_chat_protected_content(chat_id, True)  # type: ignore[attr-defined]
         except Exception as e:
             log.warning("set_chat_protected_content not applied: %s", e)
 
-        # Добавить бота и выдать базовые админ-права
-        await pyro.add_chat_members(chat_id, [req.bot_username])
-        await pyro.promote_chat_member(
-            chat_id,
-            req.bot_username,
-            can_manage_chat=True,
-            can_post_messages=True,
-            can_edit_messages=True,
+        # 3) назначить бота администратором
+        bot = await pyro.get_users(req.bot_username)
+        target = getattr(bot, "id", req.bot_username)
+
+        privileges = ChatPrivileges(
+            can_change_info=True,
+            can_post_messages=True,      # для каналов
+            can_edit_messages=True,      # для каналов
             can_delete_messages=True,
             can_invite_users=True,
+            can_restrict_members=False,
             can_pin_messages=True,
-            can_manage_video_chats=False,
             can_promote_members=False,
+            can_manage_video_chats=False,
+            is_anonymous=False,
+            # can_manage_topics=True,    # при необходимости, если доступно
         )
 
+        await pyro.promote_chat_member(chat_id, target, privileges=privileges)
+
         return CreateRoomResp(chat_id=chat_id, title=req.title)
+
     except RPCError as e:
         raise HTTPException(status_code=400, detail=f"Telegram error: {e}")
     except Exception as e:

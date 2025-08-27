@@ -57,8 +57,9 @@ services:
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - BACKEND_URL=http://backend:8000
-      - TZ=${TZ}
+      - USERBOT_URL=http://userbot:8080
       - OWNER_IDS=${OWNER_IDS}
+      - TZ=${TZ}
     volumes:
       - ./bot:/app
     depends_on:
