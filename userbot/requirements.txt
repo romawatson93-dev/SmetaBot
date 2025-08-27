@@ -1,0 +1,4 @@
+pyrogram==2.0.106
+tgcrypto
+fastapi==0.111.0
+uvicorn[standard]==0.30.0

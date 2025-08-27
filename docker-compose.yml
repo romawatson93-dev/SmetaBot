@@ -1,0 +1,123 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      TZ: ${TZ}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  backend:
+    build:
+      context: .
+      dockerfile: infra/docker/backend.Dockerfile
+    environment:
+      - APP_ENV=${APP_ENV}
+      - DATABASE_URL=${DATABASE_URL}
+      - TZ=${TZ}
+    volumes:
+      - ./backend:/app
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # без curl: проверяем /health через встроенный python
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else sys.exit(1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
+  bot:
+    build:
+      context: .
+      dockerfile: infra/docker/bot.Dockerfile
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - BACKEND_URL=http://backend:8000
+      - TZ=${TZ}
+      - OWNER_IDS=${OWNER_IDS}
+    volumes:
+      - ./bot:/app
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,urllib.request,sys; url='https://api.telegram.org/bot'+os.getenv('BOT_TOKEN','')+'/getMe'; sys.exit(0) if urllib.request.urlopen(url, timeout=5).status==200 else sys.exit(1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  userbot:
+    build:
+      context: .
+      dockerfile: infra/docker/userbot.Dockerfile
+    environment:
+      - TG_API_ID=${TG_API_ID}
+      - TG_API_HASH=${TG_API_HASH}
+      - TG_SESSION_NAME=${TG_SESSION_NAME}
+      - TZ=${TZ}
+    volumes:
+      - ./userbot:/app
+      - userbot_sessions:/sessions
+    # порядок запуска особой роли не играет, но можно дождаться старта бота
+    depends_on:
+      bot:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else sys.exit(1)\""]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  worker:
+    build:
+      context: .
+      dockerfile: infra/docker/worker.Dockerfile
+    environment:
+      - REDIS_URL=${REDIS_URL}
+      - DATABASE_URL=${DATABASE_URL}
+      - TZ=${TZ}
+      - BOT_TOKEN=${BOT_TOKEN}
+    volumes:
+      - ./worker:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,sys,redis; r=redis.Redis.from_url(os.getenv('REDIS_URL','redis://redis:6379/0')); sys.exit(0) if r.ping() else sys.exit(1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  pgdata:
+  userbot_sessions:
+
