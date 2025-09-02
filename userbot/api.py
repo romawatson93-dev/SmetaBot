@@ -2,7 +2,7 @@ import os, asyncio, secrets
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -354,3 +354,9 @@ async def add_bot_admin(req: AddBotAdminReq):
         return {"ok": True}
     finally:
         await client.disconnect()
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    # Перекидываем на веб-приложение логина
+    return RedirectResponse(url="/webapp/login", status_code=302)
