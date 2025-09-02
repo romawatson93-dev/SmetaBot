@@ -1,13 +1,37 @@
 services:
+  traefik:
+    image: traefik:v3.0
+    container_name: smetabot-traefik
+    command:
+      - --api.dashboard=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.le.acme.email=${LE_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_letsencrypt:/letsencrypt
+    restart: unless-stopped
+    networks:
+      - traefik
+
   db:
     image: postgres:15
+    container_name: smetabot-db
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
-      TZ: ${TZ}
-    ports:
-      - "5432:5432"
+      TZ: ${TZ:-UTC}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./infra/migrations:/docker-entrypoint-initdb.d:ro
@@ -16,25 +40,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
+    restart: unless-stopped
 
   redis:
     image: redis:7.2-alpine
-    ports:
-      - "6379:6379"
+    container_name: smetabot-redis
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 6
+    restart: unless-stopped
 
   backend:
     build:
       context: .
-      dockerfile: infra/docker/backend.Dockerfile
+      dockerfile: backend.Dockerfile
+    container_name: smetabot-backend
+    env_file:
+      - .env
     environment:
-      - APP_ENV=${APP_ENV}
-      - DATABASE_URL=${DATABASE_URL}
-      - TZ=${TZ}
+      TZ: ${TZ:-UTC}
     volumes:
       - ./backend:/app
     ports:
@@ -43,67 +69,80 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      # без curl: проверяем /health через встроенный python
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else sys.exit(1)\""]
+      test:
+        [
+          "CMD-SHELL",
+          "python - << 'PY'\nimport urllib.request,sys;sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else sys.exit(1)\nPY"
+        ]
       interval: 10s
       timeout: 3s
       retries: 6
       start_period: 15s
-
-  bot:
-    build:
-      context: .
-      dockerfile: infra/docker/bot.Dockerfile
-    environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - BACKEND_URL=http://backend:8000
-      - USERBOT_URL=http://userbot:8080
-      - OWNER_IDS=${OWNER_IDS}
-      - TZ=${TZ}
-    volumes:
-      - ./bot:/app
-    depends_on:
-      backend:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os,urllib.request,sys; url='https://api.telegram.org/bot'+os.getenv('BOT_TOKEN','')+'/getMe'; sys.exit(0) if urllib.request.urlopen(url, timeout=5).status==200 else sys.exit(1)\""]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
+    restart: unless-stopped
 
   userbot:
     build:
       context: .
-      dockerfile: infra/docker/userbot.Dockerfile
+      dockerfile: userbot.Dockerfile
+    container_name: smetabot-userbot
+    env_file:
+      - .env
     environment:
-      - TG_API_ID=${TG_API_ID}
-      - TG_API_HASH=${TG_API_HASH}
-      - TG_SESSION_NAME=${TG_SESSION_NAME}
-      - TZ=${TZ}
+      TZ: ${TZ:-UTC}
+      SESSIONS_DIR: /app/sessions
     volumes:
-      - ./userbot:/app
-      - userbot_sessions:/sessions
-    # порядок запуска особой роли не играет, но можно дождаться старта бота
-    depends_on:
-      bot:
-        condition: service_started
+      - ./userbot:/app/userbot
+      - userbot_sessions:/app/sessions
+    expose:
+      - "8001"
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else sys.exit(1)\""]
-      interval: 20s
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/docs"]
+      interval: 15s
       timeout: 5s
       retries: 6
       start_period: 20s
+    restart: unless-stopped
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.userbot.rule=Host(`orbitsend.ru`)
+      - traefik.http.routers.userbot.entrypoints=websecure
+      - traefik.http.routers.userbot.tls=true
+      - traefik.http.routers.userbot.tls.certresolver=le
+      - traefik.http.services.userbot.loadbalancer.server.port=8001
+      - traefik.http.middlewares.userbot-compress.compress=true
+      - traefik.http.routers.userbot.middlewares=userbot-compress
+
+  bot:
+    build:
+      context: .
+      dockerfile: bot.Dockerfile
+    container_name: smetabot-bot
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-UTC}
+      USERBOT_URL: http://userbot:8001
+    volumes:
+      - ./bot:/app
+    depends_on:
+      userbot:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
 
   worker:
     build:
       context: .
-      dockerfile: infra/docker/worker.Dockerfile
+      dockerfile: worker.Dockerfile
+    container_name: smetabot-worker
+    env_file:
+      - .env
     environment:
-      - REDIS_URL=${REDIS_URL}
-      - DATABASE_URL=${DATABASE_URL}
-      - TZ=${TZ}
-      - BOT_TOKEN=${BOT_TOKEN}
+      TZ: ${TZ:-UTC}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - ./worker:/app
     depends_on:
@@ -111,14 +150,13 @@ services:
         condition: service_healthy
       backend:
         condition: service_started
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os,sys,redis; r=redis.Redis.from_url(os.getenv('REDIS_URL','redis://redis:6379/0')); sys.exit(0) if r.ping() else sys.exit(1)\""]
-      interval: 15s
-      timeout: 5s
-      retries: 6
-      start_period: 20s
+    restart: unless-stopped
 
 volumes:
-  pgdata:
-  userbot_sessions:
+  pgdata: {}
+  userbot_sessions: {}
+  traefik_letsencrypt: {}
 
+networks:
+  traefik:
+    name: traefik

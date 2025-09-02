@@ -1,16 +1,30 @@
-.PHONY: up down logs fmt lint migrate
+COMPOSE ?= docker compose
+
+.PHONY: up down ps logs logs-userbot logs-bot restart-bot restart-userbot build
 
 up:
-\tdocker compose up -d --build
+	$(COMPOSE) up -d --build
 
 down:
-\tdocker compose down -v
+	$(COMPOSE) down
+
+ps:
+	$(COMPOSE) ps
 
 logs:
-\tdocker compose logs -f --tail=200
+	$(COMPOSE) logs -f
 
-fmt:
-\tblack backend bot userbot worker || true
+logs-userbot:
+	$(COMPOSE) logs -f userbot
 
-migrate:
-\t@echo "Migrations are auto-applied by Postgres init scripts in infra/migrations"
+logs-bot:
+	$(COMPOSE) logs -f bot
+
+restart-bot:
+	$(COMPOSE) restart bot
+
+restart-userbot:
+	$(COMPOSE) restart userbot
+
+build:
+	$(COMPOSE) build --no-cache

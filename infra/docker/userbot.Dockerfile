@@ -1,13 +1,21 @@
 FROM python:3.11-slim
+
+# Ставим системные утилиты, чтобы healthcheck мог использовать curl
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-COPY userbot/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+# Устанавливаем зависимости
+COPY userbot/requirements.txt /app/userbot/requirements.txt
+RUN pip install --no-cache-dir -r /app/userbot/requirements.txt
 
-VOLUME ["/sessions"]
-ENV TG_SESSION_NAME=userbot
+# Копируем исходники
+COPY userbot /app/userbot
 
-COPY userbot /app
-EXPOSE 8080
-CMD ["python", "main.py"]
+# Папка для зашифрованных сессий (монтируется томом)
+RUN mkdir -p /app/sessions
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8001
+CMD ["python", "-m", "userbot"]
