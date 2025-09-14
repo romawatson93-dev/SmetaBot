@@ -12,8 +12,8 @@ from telethon.errors import FloodWaitError
 from telethon.errors.rpcerrorlist import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError
 )
-from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest
-from telethon.tl.types import ChatAdminRights
+from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest, InviteToChannelRequest
+from telethon.tl.types import ChatAdminRights, PeerChannel
 from telethon.tl.functions.messages import ToggleNoForwardsRequest
 
 from cryptography.fernet import Fernet
@@ -27,6 +27,7 @@ API_HASH = os.getenv("API_HASH") or os.getenv("TG_API_HASH") or ""
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 FLOODWAIT_FALLBACK = int(os.getenv("USERBOT_FLOODWAIT_FALLBACK", "5"))
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "/app/sessions")
+BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lstrip("@")
 
 if not API_ID or not API_HASH:
     raise RuntimeError("API_ID/API_HASH not set")
@@ -245,6 +246,20 @@ function getUserId() {
   return u?.id?.toString() || "";
 }
 
+async function checkSession() {
+  const contractor_id = getUserId();
+  if (!contractor_id) return;
+  try {
+    const r = await fetch(`/session/status?contractor_id=${encodeURIComponent(contractor_id)}&verify=true`);
+    if (!r.ok) return;
+    const info = await r.json();
+    if (info.has_session && info.authorized) {
+      showOk();
+      try { tg.sendData(JSON.stringify({ action: 'session_ready' })); } catch (e) {}
+    }
+  } catch (_) {}
+}
+
 async function start() {
   const phone = document.getElementById("phone").value.trim();
   const contractor_id = getUserId();
@@ -275,6 +290,7 @@ async function confirmCode() {
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
     if (data.status === "ready") {
+      try { tg.sendData(JSON.stringify({ action: 'session_ready' })); } catch (e) {}
       showOk();
     } else {
       showStep(3);
@@ -291,6 +307,7 @@ async function confirmPassword() {
       body: JSON.stringify({ token, password })
     });
     if (!r.ok) throw new Error(await r.text());
+    try { tg.sendData(JSON.stringify({ action: 'session_ready' })); } catch (e) {}
     showOk();
   } catch (e) { setMsg("Ошибка: " + e.message); }
 }
@@ -308,11 +325,142 @@ function showOk(){
   document.getElementById("ok").style.display="block";
   setMsg("Готово. Вернитесь в чат с ботом.");
 }
-function setMsg(t){ document.getElementById("msg").textContent = t; }
+ function setMsg(t){ document.getElementById("msg").textContent = t; }
+ // Run session check on load
+ checkSession();
 </script>
 </body>
 </html>
     """)
+
+
+@app.get("/webapp/login2", response_class=HTMLResponse)
+async def webapp_login2():
+    deep_link = f"https://t.me/{BOT_USERNAME}?start=auth_done" if BOT_USERNAME else ""
+    html = """
+<!doctype html>
+<html lang=\"ru\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />
+  <title>Подключение аккаунта</title>
+  <script src=\"https://telegram.org/js/telegram-web-app.js\"></script>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:16px; }}
+    .card {{ padding:16px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,.08); }}
+    input {{ width:100%; padding:12px; margin:8px 0; border:1px solid #ddd; border-radius:8px; font-size:16px; }}
+    button {{ width:100%; padding:12px; border:0; border-radius:10px; font-size:16px; }}
+    .primary {{ background:#2ea6ff; color:#fff; }}
+    .ghost {{ background:#f3f5f7; }}
+    .muted {{ color:#666; font-size:14px; }}
+    #ok,#open {{ display:none; }}
+  </style>
+</head>
+<body>
+  <div class=\"card\"> 
+    <h3>Вход в Telegram</h3>
+    <p class=\"muted\">Введите телефон, затем код (и пароль 2FA, если включён).</p>
+
+    <div id=\"open\"> 
+      <p>Эту страницу нужно открывать из бота в Telegram.</p>
+      {'<button class=\\"primary\\" onclick=\\"openBot()\\">Открыть бота</button>' if deep_link else ''}
+    </div>
+
+    <div id=\"step1\"> 
+      <input id=\"phone\" type=\"tel\" placeholder=\"+79991234567\" />
+      <button class=\"primary\" onclick=\"start()\">Отправить код</button>
+    </div>
+
+    <div id=\"step2\" style=\"display:none\"> 
+      <input id=\"code\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"Код из Telegram / SMS\" />
+      <button class=\"primary\" onclick=\"confirmCode()\">Подтвердить код</button>
+      <p class=\"muted\">Если требуется пароль — перейдите к следующему шагу.</p>
+    </div>
+
+    <div id=\"step3\" style=\"display:none\"> 
+      <input id=\"password\" type=\"password\" placeholder=\"Пароль 2FA\" />
+      <button class=\"primary\" onclick=\"confirmPassword()\">Готово</button>
+    </div>
+
+    <div id=\"ok\"> 
+      <p>✅ Сессия подключена. Можно вернуться в чат.</p>
+      {'<button class=\\"ghost\\" onclick=\\"openBot()\\">Открыть бота</button>' if deep_link else '<button class=\\"ghost\\" onclick=\\"Telegram.WebApp.close()\\">Закрыть</button>'}
+    </div>
+
+    <p id=\"msg\" class=\"muted\"></p>
+  </div>
+
+<script>
+const tg = window.Telegram.WebApp; tg.expand();
+const deepLink = {json.dumps(deep_link)};
+let token = null;
+
+function openBot() {{ if (deepLink) {{ try {{ tg.openTelegramLink(deepLink); }} catch(e) {{ location.href = deepLink; }} }} }}
+function getUserId() {{ const u = tg.initDataUnsafe?.user; return u?.id?.toString() || ""; }}
+
+async function checkSession() {{
+  const contractor_id = getUserId();
+  if (!contractor_id) {{ document.getElementById('open').style.display='block'; document.getElementById('step1').style.display='none'; return; }}
+  try {{
+    const r = await fetch(`/session/status?contractor_id=${{encodeURIComponent(contractor_id)}}&verify=true`);
+    if (!r.ok) return; const info = await r.json();
+    if (info.has_session && info.authorized) {{ showOk(); try {{ tg.sendData(JSON.stringify({{ action:'session_ready' }})); }} catch(e) {{}} }}
+  }} catch(_) {{}}
+}}
+
+async function start() {{
+  const phone = document.getElementById('phone').value.trim(); const contractor_id = getUserId();
+  if (!phone.startsWith('+') || phone.length < 10) return setMsg('Формат номера: +79991234567');
+  if (!contractor_id) return setMsg('Не удалось получить Telegram ID. Откройте мини‑приложение из бота.');
+  try {{
+    const r = await fetch('/login/phone/start', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{ contractor_id, phone }}) }});
+    if (!r.ok) throw new Error(await r.text()); const data = await r.json(); token=data.token; showStep(2); setMsg('Код отправлен в Telegram/SMS.');
+  }} catch(e) {{ setMsg('Ошибка: ' + e.message); }}
+}}
+
+async function confirmCode() {{
+  try {{
+    const code = document.getElementById('code').value.trim();
+    const r = await fetch('/login/phone/confirm', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{ token, code }}) }});
+    if (!r.ok) throw new Error(await r.text()); const data = await r.json();
+    if (data.status==='ready') {{ try {{ tg.sendData(JSON.stringify({{ action:'session_ready' }})); }} catch(e) {{}} showOk(); }}
+    else {{ showStep(3); setMsg('Введите пароль 2FA.'); }}
+  }} catch(e) {{ setMsg('Ошибка: ' + e.message); }}
+}}
+
+async function confirmPassword() {{
+  try {{
+    const password = document.getElementById('password').value;
+    const r = await fetch('/login/phone/2fa', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{ token, password }}) }});
+    if (!r.ok) throw new Error(await r.text()); try {{ tg.sendData(JSON.stringify({{ action:'session_ready' }})); }} catch(e) {{}} showOk();
+  }} catch(e) {{ setMsg('Ошибка: ' + e.message); }}
+}}
+
+function showStep(n) {{
+  document.getElementById('step1').style.display=(n===1)?'':'none';
+  document.getElementById('step2').style.display=(n===2)?'':'none';
+  document.getElementById('step3').style.display=(n===3)?'':'none';
+  document.getElementById('ok').style.display='none';
+}}
+function showOk() {{
+  document.getElementById('step1').style.display='none';
+  document.getElementById('step2').style.display='none';
+  document.getElementById('step3').style.display='none';
+  document.getElementById('ok').style.display='block'; setMsg('Готово. Можно вернуться в чат.'); if (deepLink) openBot();
+}}
+function setMsg(t) {{ document.getElementById('msg').textContent = t; }}
+checkSession();
+</script>
+</body>
+</html>
+    """
+    # Inject dynamic pieces without using f-strings inside HTML
+    open_btn = '<button class="primary" onclick="openBot()">Открыть бота</button>' if deep_link else ''
+    ok_btn = '<button class="ghost" onclick="openBot()">Открыть бота</button>' if deep_link else '<button class="ghost" onclick="Telegram.WebApp.close()">Закрыть</button>'
+    html = html.replace("{'<button class=\\\"primary\\\" onclick=\\\"openBot()\\\">Открыть бота</button>' if deep_link else ''}", open_btn)
+    html = html.replace("{'<button class=\\\"ghost\\\" onclick=\\\"openBot()\\\">Открыть бота</button>' if deep_link else '<button class=\\\"ghost\\\" onclick=\\\"Telegram.WebApp.close()\\\">Закрыть</button>'}", ok_btn)
+    html = html.replace("{json.dumps(deep_link)}", json.dumps(deep_link))
+    return HTMLResponse(html)
 
 
 # ---------- ROOMS ----------
@@ -328,7 +476,7 @@ async def create_room(req: CreateRoomReq):
         )))
         ch = r.chats[0]
         await asyncio.sleep(1.5)
-        await with_floodwait(client(ToggleNoForwardsRequest(channel=ch, enabled=True)))
+        await with_floodwait(client(ToggleNoForwardsRequest(peer=ch, enabled=True)))
         await asyncio.sleep(1.0)
         return CreateRoomResp(channel_id=ch.id)
     finally:
@@ -338,18 +486,33 @@ async def create_room(req: CreateRoomReq):
 async def add_bot_admin(req: AddBotAdminReq):
     client = await get_client_for_contractor(req.contractor_id)
     try:
-        entity = await client.get_entity(req.channel_id)
-        bot = await client.get_entity(req.bot_username)
+        # Ensure we resolve a channel, not a user with the same numeric id
+        entity = await client.get_entity(PeerChannel(int(req.channel_id)))
+        bot_username = req.bot_username
+        if bot_username and not bot_username.startswith("@"):  # normalize
+            bot_username = f"@{bot_username}"
+        bot = await client.get_entity(bot_username)
         rights = ChatAdminRights(
             post_messages=True, invite_users=True,
-            add_admins=False, change_info=False,
+            add_admins=False, change_info=True,
             ban_users=False, delete_messages=False,
             pin_messages=False, manage_call=False,
             anonymous=False, edit_messages=False
         )
-        await with_floodwait(client(EditAdminRequest(
-            channel=entity, user_id=bot, admin_rights=rights, rank="bot"
-        )))
+        try:
+            await with_floodwait(client(EditAdminRequest(
+                channel=entity, user_id=bot, admin_rights=rights, rank="bot"
+            )))
+        except Exception:
+            # Try inviting first (for supergroups) then promote
+            try:
+                await with_floodwait(client(InviteToChannelRequest(channel=entity, users=[bot])))
+                await asyncio.sleep(0.8)
+            except Exception:
+                pass
+            await with_floodwait(client(EditAdminRequest(
+                channel=entity, user_id=bot, admin_rights=rights, rank="bot"
+            )))
         await asyncio.sleep(0.5)
         return {"ok": True}
     finally:
