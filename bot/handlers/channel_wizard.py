@@ -233,7 +233,7 @@ async def on_avatar_photo(m: Message, state: FSMContext):
         pass
     await state.update_data(avatar_state='added', avatar_bytes=data, step=3)
     await state.set_state(CreateChannel.input_files)
-    await _render_card(m.bot, m.chat.id, state, "Прикрепите PDF-файлы по очереди, как документ (файлом). Под превью будут кнопки.", _kb_step3())
+    await m.answer('Шаг 3: прикрепите PDF (или пропустите).', reply_markup=_kb_step3())
 
 
 @router.callback_query(StateFilter(CreateChannel.input_avatar), F.data == "cw:avatar:std")
@@ -242,7 +242,7 @@ async def on_avatar_std(cq: CallbackQuery, state: FSMContext):
     # Заглушка: стандартная аватарка пока не настроена — помечаем как стандартная без байтов
     await state.update_data(avatar_state='std', avatar_bytes=None, step=3)
     await state.set_state(CreateChannel.input_files)
-    await _render_card(cq.bot, cq.message.chat.id, state, "Прикрепите PDF-файлы по очереди, как документ (файлом). Под превью будут кнопки.", _kb_step3())
+    await cq.message.answer('Шаг 3: прикрепите PDF (или пропустите).', reply_markup=_kb_step3())
     await cq.answer()
 
 
@@ -251,7 +251,7 @@ async def on_avatar_skip(cq: CallbackQuery, state: FSMContext):
     print("[wizard] on_avatar_skip")
     await state.update_data(avatar_state='skipped', avatar_bytes=None, step=3)
     await state.set_state(CreateChannel.input_files)
-    await _render_card(cq.bot, cq.message.chat.id, state, "Прикрепите PDF-файлы по очереди, как документ (файлом). Под превью будут кнопки.", _kb_step3())
+    await cq.message.answer('Шаг 3: прикрепите PDF (или пропустите).', reply_markup=_kb_step3())
     await cq.answer()
 
 
@@ -346,7 +346,7 @@ async def on_file_add_more(cq: CallbackQuery, state: FSMContext):
 @router.callback_query(StateFilter(CreateChannel.input_files), F.data == "cw:files:done")
 async def on_files_done(cq: CallbackQuery, state: FSMContext):
     print("[wizard] on_files_done")
-    await state.update_data(step=4)
+    await state.update_data(step=4, files_done=True)
     await state.set_state(CreateChannel.input_wm)
     await _render_card(cq.bot, cq.message.chat.id, state, "Напишите короткий текст для водяного знака или нажмите ‘Пропустить’.", _kb_step4_initial())
     await cq.answer()
