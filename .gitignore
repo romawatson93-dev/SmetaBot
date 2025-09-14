@@ -69,6 +69,11 @@ tmp/
 *.bak
 *.orig
 
+# Local temp dumps/backups (do not commit)
+__dump_*.txt
+_tmp_*.txt
+*backup*.txt
+
 # OS files
 .DS_Store
 Thumbs.db
