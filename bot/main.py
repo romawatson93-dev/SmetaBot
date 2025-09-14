@@ -39,11 +39,11 @@ else:
 dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(webapp_gate_router)
 dp.include_router(webapp_router)
+dp.include_router(profile_router)
 dp.include_router(reply_menu_router)
 dp.include_router(channel_wizard_router)
 dp.include_router(finalize_router)
 dp.include_router(my_channels_router)
-dp.include_router(profile_router)
 router = Router(); dp.include_router(router)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
