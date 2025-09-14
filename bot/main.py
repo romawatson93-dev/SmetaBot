@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS invites(
   approved_count INTEGER NOT NULL DEFAULT 0,
   UNIQUE(invite_link)
 );
+CREATE TABLE IF NOT EXISTS profiles(
+  contractor_id TEXT PRIMARY KEY,
+  std_avatar BLOB
+);
 """
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as conn:

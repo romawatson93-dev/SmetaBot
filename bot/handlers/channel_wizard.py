@@ -463,7 +463,26 @@ async def on_any_document(m: Message, state: FSMContext):
 async def _execute_job(bot: Bot, user_id: int, d: dict) -> tuple[int | None, str]:
     contractor_id = str(user_id)
     title = d.get('title') or f"Канал {user_id}"
-    avatar_bytes = d.get('avatar_bytes') if d.get('avatar_state') == 'added' else None
+    avatar_state = d.get('avatar_state')
+    avatar_bytes = d.get('avatar_bytes') if avatar_state == 'added' else None
+    if (not avatar_bytes) and avatar_state == 'std':
+        # Pull standard avatar from profile storage, if present
+        try:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS profiles(
+                      contractor_id TEXT PRIMARY KEY,
+                      std_avatar BLOB
+                    )
+                    """
+                )
+                async with conn.execute("SELECT std_avatar FROM profiles WHERE contractor_id=?", (contractor_id,)) as cur:
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        avatar_bytes = row[0]
+        except Exception:
+            avatar_bytes = None
 
     # 1) Создать канал от имени userbot и выдать боту права
     r = await userbot_post("/rooms/create", {"contractor_id": contractor_id, "title": title})
