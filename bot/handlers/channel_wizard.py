@@ -481,6 +481,19 @@ async def _execute_job(bot: Bot, user_id: int, d: dict) -> tuple[int | None, str
                 print(f"[wizard] set_chat_photo failed: {e}")
             except Exception:
                 pass
+            # Fallback: set photo via userbot client API right after creation
+            try:
+                import base64 as _b64
+                await userbot_post("/rooms/set_photo", {
+                    "contractor_id": contractor_id,
+                    "channel_id": channel_id,
+                    "photo_b64": _b64.b64encode(avatar_bytes).decode("ascii"),
+                })
+            except Exception as e2:
+                try:
+                    print(f"[wizard] userbot set_photo failed: {e2}")
+                except Exception:
+                    pass
 
     # 3) Сохранить проект в локальную БД
     async with aiosqlite.connect(DB_PATH) as conn:

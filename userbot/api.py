@@ -12,8 +12,8 @@ from telethon.errors import FloodWaitError
 from telethon.errors.rpcerrorlist import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError
 )
-from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest, InviteToChannelRequest
-from telethon.tl.types import ChatAdminRights, PeerChannel
+from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest, InviteToChannelRequest, EditPhotoRequest
+from telethon.tl.types import ChatAdminRights, PeerChannel, InputChatUploadedPhoto
 from telethon.tl.functions.messages import ToggleNoForwardsRequest
 
 from cryptography.fernet import Fernet
@@ -114,6 +114,11 @@ class AddBotAdminReq(BaseModel):
     contractor_id: str
     channel_id: int
     bot_username: str
+
+class SetPhotoReq(BaseModel):
+    contractor_id: str
+    channel_id: int
+    photo_b64: str  # base64-encoded image bytes (JPEG/PNG)
 
 # ---------- SESSION STATUS ----------
 @app.get("/session/status", response_model=SessionStatusResp)
@@ -513,6 +518,22 @@ async def add_bot_admin(req: AddBotAdminReq):
             await with_floodwait(client(EditAdminRequest(
                 channel=entity, user_id=bot, admin_rights=rights, rank="bot"
             )))
+        await asyncio.sleep(0.5)
+        return {"ok": True}
+    finally:
+        await client.disconnect()
+
+
+@app.post("/rooms/set_photo")
+async def set_room_photo(req: SetPhotoReq):
+    """Set channel photo using the user's session (more reliable right after creation)."""
+    import base64
+    client = await get_client_for_contractor(req.contractor_id)
+    try:
+        entity = await client.get_entity(PeerChannel(int(req.channel_id)))
+        raw = base64.b64decode(req.photo_b64)
+        up = await with_floodwait(client.upload_file(raw))
+        await with_floodwait(client(EditPhotoRequest(channel=entity, photo=InputChatUploadedPhoto(up))))
         await asyncio.sleep(0.5)
         return {"ok": True}
     finally:
