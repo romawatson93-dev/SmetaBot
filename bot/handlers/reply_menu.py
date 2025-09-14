@@ -5,10 +5,12 @@ from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 import aiosqlite
+from aiogram.fsm.state import StatesGroup, State
 
 router = Router()
 
 USERBOT_URL = os.getenv("USERBOT_URL", "http://userbot:8001")
+DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data.db"))
 
 
 async def userbot_get(path: str, params=None):
@@ -122,4 +124,3 @@ async def msg_profile(m: Message):
 @router.message(F.text == "❓ Помощь")
 async def msg_help(m: Message):
     await m.answer("Помощь:\n- 🆕 Новый канал — создать закрытый канал и выдать права боту.\n- 📚 Мои каналы — список ваших каналов.\n- 🔗 Мои ссылки — сгенерировать приглашение (join-request).\n- 🖼️ Рендер в PNG — отправьте PDF как документ для конвертации.\n- 👤 Личный кабинет — настройки (в разработке).")
-

@@ -34,6 +34,7 @@ async def cmd_profile(m: Message, state: FSMContext):
 # Open via Reply menu button as well
 @router.message(F.text == "👤 Личный кабинет")
 @router.message(F.text == "Личный кабинет")
+@router.message(F.text == "?? ���� �������")
 async def open_profile_from_menu(m: Message, state: FSMContext):
     await cmd_profile(m, state)
 
