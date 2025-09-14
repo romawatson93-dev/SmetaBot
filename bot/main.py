@@ -7,6 +7,7 @@ from bot.handlers.reply_menu import router as reply_menu_router
 from bot.handlers.channel_wizard import router as channel_wizard_router
 from bot.handlers.finalize import router as finalize_router
 from bot.handlers.my_channels import router as my_channels_router
+from bot.handlers.profile import router as profile_router
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
@@ -42,6 +43,7 @@ dp.include_router(reply_menu_router)
 dp.include_router(channel_wizard_router)
 dp.include_router(finalize_router)
 dp.include_router(my_channels_router)
+dp.include_router(profile_router)
 router = Router(); dp.include_router(router)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")

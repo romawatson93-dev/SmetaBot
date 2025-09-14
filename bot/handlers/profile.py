@@ -30,6 +30,13 @@ async def cmd_profile(m: Message, state: FSMContext):
     await m.answer("Личный кабинет:", reply_markup=profile_kb())
 
 
+# Open via Reply menu button as well
+@router.message(F.text == "👤 Личный кабинет")
+@router.message(F.text == "Личный кабинет")
+async def open_profile_from_menu(m: Message, state: FSMContext):
+    await cmd_profile(m, state)
+
+
 @router.message(F.text == "🖼 Загрузить аватарку")
 async def profile_upload_avatar_start(m: Message, state: FSMContext):
     await state.set_state(Profile.waiting_avatar)
@@ -92,4 +99,3 @@ async def profile_back_to_menu(m: Message, state: FSMContext):
     except Exception:
         has = False
     await m.answer("Меню:", reply_markup=reply_menu_for(m.from_user.id, has))
-
