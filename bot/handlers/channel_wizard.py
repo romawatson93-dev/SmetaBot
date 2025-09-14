@@ -310,7 +310,7 @@ async def on_file(m: Message, state: FSMContext):
         await state.update_data(last_preview_mid=sent.message_id)
 
     # Обновляем карточку (ещё остаёмся на шаге 3). Карточка будет внизу.
-    await _render_card(m.bot, m.chat.id, state, "Можно добавить ещё файлы, отменить последний или продолжить.", _kb_step3())
+    # Do not render checklist card yet; let user work with preview first
 
 
 @router.callback_query(StateFilter(CreateChannel.input_files), F.data == "cw:file:remove")
