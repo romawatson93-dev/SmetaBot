@@ -6,6 +6,8 @@ services:
       - --api.dashboard=true
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
+      - --providers.file.directory=/etc/traefik/dynamic
+      - --providers.file.watch=true
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
@@ -20,6 +22,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - traefik_letsencrypt:/letsencrypt
+      - ./infra/traefik/dynamic:/etc/traefik/dynamic:ro
     restart: unless-stopped
     networks:
       - traefik
@@ -96,7 +99,11 @@ services:
     expose:
       - "8001"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8001/docs"]
+      test:
+        [
+          "CMD-SHELL",
+          "python - << 'PY'\nimport urllib.request,sys;sys.exit(0) if urllib.request.urlopen('http://localhost:8001/health', timeout=3).status==200 else sys.exit(1)\nPY"
+        ]
       interval: 15s
       timeout: 5s
       retries: 6
@@ -124,9 +131,12 @@ services:
     environment:
       TZ: ${TZ:-UTC}
       USERBOT_URL: http://userbot:8001
+      REDIS_URL: ${REDIS_URL:-redis://smetabot-redis:6379/0}
     volumes:
-      - ./bot:/app
+      - ./bot:/app/bot
     depends_on:
+      redis:
+        condition: service_healthy
       userbot:
         condition: service_healthy
       backend:

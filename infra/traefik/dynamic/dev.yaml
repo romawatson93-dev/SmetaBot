@@ -1,0 +1,25 @@
+http:
+  routers:
+    userbot-dev:
+      rule: Host(`dev.orbitsend.ru`)
+      entryPoints:
+        - websecure
+      tls:
+        certResolver: le
+      service: userbot-dev
+      middlewares:
+        - compress
+
+  services:
+    userbot-dev:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          # Replace with your local machine's Tailscale IPv4 address
+          # Find it via: `tailscale ip -4` on your PC
+          - url: "http://100.100.100.100:8001"
+
+  middlewares:
+    compress:
+      compress: {}
+

@@ -1,30 +1,42 @@
-COMPOSE ?= docker compose
-
-.PHONY: up down ps logs logs-userbot logs-bot restart-bot restart-userbot build
+.PHONY: up down rebuild logs-bot logs-userbot ps
 
 up:
-	$(COMPOSE) up -d --build
+	docker compose up -d userbot backend bot worker
 
 down:
-	$(COMPOSE) down
+	docker compose down
 
-ps:
-	$(COMPOSE) ps
-
-logs:
-	$(COMPOSE) logs -f
-
-logs-userbot:
-	$(COMPOSE) logs -f userbot
+rebuild:
+	docker compose build --no-cache userbot backend bot worker
+	docker compose up -d userbot backend bot worker
 
 logs-bot:
-	$(COMPOSE) logs -f bot
+	docker compose logs -f --tail=200 bot
 
-restart-bot:
-	$(COMPOSE) restart bot
+logs-userbot:
+	docker compose logs -f --tail=200 userbot
 
-restart-userbot:
-	$(COMPOSE) restart userbot
+ps:
+	docker compose ps
 
-build:
-	$(COMPOSE) build --no-cache
+# --- Dev shortcuts (use .env.dev) ---
+.PHONY: dev-up dev-down dev-rebuild dev-logs-bot dev-logs-userbot dev-ps
+
+dev-up:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d userbot backend bot worker
+
+dev-down:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml down
+
+dev-rebuild:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml build --no-cache userbot backend bot worker
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d userbot backend bot worker
+
+dev-logs-bot:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f --tail=200 bot
+
+dev-logs-userbot:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f --tail=200 userbot
+
+dev-ps:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml ps
