@@ -7,3 +7,4 @@ redis==5.0.7
 aiohttp-socks==0.9.1
 pymupdf
 Pillow
+openpyxl>=3.1.2

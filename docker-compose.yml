@@ -131,7 +131,7 @@ services:
     environment:
       TZ: ${TZ:-UTC}
       USERBOT_URL: http://userbot:8001
-      REDIS_URL: ${REDIS_URL:-redis://smetabot-redis:6379/0}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - ./bot:/app/bot
     depends_on:
@@ -142,6 +142,9 @@ services:
       backend:
         condition: service_started
     restart: unless-stopped
+    networks:
+      - default
+      - traefik
 
   worker:
     build:
@@ -154,7 +157,7 @@ services:
       TZ: ${TZ:-UTC}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     volumes:
-      - ./worker:/app
+      - ./worker:/app/worker
     depends_on:
       redis:
         condition: service_healthy

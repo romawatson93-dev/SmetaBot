@@ -526,13 +526,28 @@ async def add_bot_admin(req: AddBotAdminReq):
 
 @app.post("/rooms/set_photo")
 async def set_room_photo(req: SetPhotoReq):
-    """Set channel photo using the user's session (more reliable right after creation)."""
-    import base64
+    """Set channel photo using the user's session (more reliable right after creation).
+
+    Telegram requires chat photos to be in JPEG; convert if needed.
+    """
+    import base64, io
+    from PIL import Image
     client = await get_client_for_contractor(req.contractor_id)
     try:
         entity = await client.get_entity(PeerChannel(int(req.channel_id)))
         raw = base64.b64decode(req.photo_b64)
-        up = await with_floodwait(client.upload_file(raw))
+        # Ensure JPEG format
+        try:
+            img = Image.open(io.BytesIO(raw))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            buf.seek(0)
+            jpeg_bytes = buf.read()
+        except Exception:
+            jpeg_bytes = raw
+        up = await with_floodwait(client.upload_file(jpeg_bytes))
         await with_floodwait(client(EditPhotoRequest(channel=entity, photo=InputChatUploadedPhoto(up))))
         await asyncio.sleep(0.5)
         return {"ok": True}

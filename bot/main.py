@@ -1,9 +1,11 @@
+import logging
 import os, asyncio, base64
 import aiosqlite, httpx
 from dotenv import load_dotenv
 from bot.handlers.webapp_gate import router as webapp_gate_router
 from bot.handlers.webapp import router as webapp_router
 from bot.handlers.reply_menu import router as reply_menu_router
+from bot.handlers.render_pdf import router as render_pdf_router
 from bot.handlers.channel_wizard import router as channel_wizard_router
 from bot.handlers.finalize import router as finalize_router
 from bot.handlers.my_channels import router as my_channels_router
@@ -22,6 +24,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
+logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -41,6 +44,7 @@ dp.include_router(webapp_gate_router)
 dp.include_router(webapp_router)
 dp.include_router(profile_router)
 dp.include_router(reply_menu_router)
+dp.include_router(render_pdf_router)
 dp.include_router(channel_wizard_router)
 dp.include_router(finalize_router)
 dp.include_router(my_channels_router)

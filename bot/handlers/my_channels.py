@@ -207,7 +207,7 @@ async def cb_prev_pub(cq: CallbackQuery, state: FSMContext):
             pass
     from celery import Celery
     celery_app = Celery("bot", broker=os.getenv("REDIS_URL", "redis://redis:6379/0"))
-    celery_app.send_task("worker.tasks.render.process_and_publish_pdf", args=[cid, b64, wm_text, out_name])
+    celery_app.send_task("tasks.render.process_and_publish_pdf", args=[cid, b64, wm_text, out_name])
     try:
         await cq.message.edit_caption(caption="✅ Отправлено. Готовые PNG появятся в канале через ~5 сек.")
     except Exception:
@@ -240,4 +240,3 @@ async def cb_close(cq: CallbackQuery, state: FSMContext):
             pass
     await state.update_data(channels_mid=None)
     await cq.answer()
-
