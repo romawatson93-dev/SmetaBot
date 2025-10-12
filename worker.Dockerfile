@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/worker
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/worker:/app
 
 ENV SAL_USE_VCLPLUGIN=headless
 
@@ -24,6 +24,9 @@ RUN set -eux; \
 
 COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Shared utilities (watermark config, etc.)
+COPY common/ /app/common/
 
 # Copy package into /app/worker so it is importable as `import worker`
 COPY worker/ /app/worker/

@@ -25,6 +25,9 @@ RUN set -eux; \
 COPY bot/requirements.txt /app/bot/requirements.txt
 RUN pip install --no-cache-dir -r /app/bot/requirements.txt
 
+# Shared utilities
+COPY common/ /app/common/
+
 # Copy source under package path
 COPY bot/ /app/bot/
 

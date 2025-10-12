@@ -61,11 +61,23 @@ try:
 except Exception:
     _PIL_OK = False
 
+from common.watermark import WATERMARK_SETTINGS, WatermarkSettings
+
 router = Router()
 
 DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data.db"))
 MAX_FILE_SIZE = 20 * 1024 * 1024
 logger = logging.getLogger(__name__)
+
+_RENDER_LOCKS: Dict[int, asyncio.Lock] = {}
+
+
+def _get_render_lock(user_id: int) -> asyncio.Lock:
+    lock = _RENDER_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _RENDER_LOCKS[user_id] = lock
+    return lock
 
 ROW_GAP_TOLERANCE = 3
 
@@ -93,7 +105,14 @@ def _convert_pdf(data: bytes, filename: str) -> List[Dict[str, Any]]:
         for idx, page in enumerate(doc, start=1):
             pix = page.get_pixmap(dpi=300, alpha=False)
             out_name = f"{base}-{idx:02}.png" if total > 1 else f"{base}.png"
-            pages.append({"filename": out_name, "content": pix.tobytes("png")})
+            pages.append(
+                {
+                    "filename": out_name,
+                    "content": pix.tobytes("png"),
+                    "page_index": idx,
+                    "pages_total": total,
+                }
+            )
     finally:
         doc.close()
     return pages
@@ -577,12 +596,14 @@ def _extract_excel_tables(excel_bytes: bytes, filename: str) -> dict[str, Any]:
         wb.close()
 
 
-def _load_font(size: int) -> ImageFont.FreeTypeFont:
+def _load_font(size: int, settings: WatermarkSettings = WATERMARK_SETTINGS) -> ImageFont.FreeTypeFont:
     candidates = [
+        settings.font_preferred,
         "Roboto-Bold.ttf",
         "Roboto-Regular.ttf",
         "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
         "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
+        settings.font_fallback,
         "DejaVuSans.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
@@ -597,18 +618,32 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont:
 def _watermark_bytes(png_bytes: bytes, text: str) -> bytes:
     if not _PIL_OK:
         raise RuntimeError("Pillow недоступен для нанесения водяного знака.")
+    cfg = WATERMARK_SETTINGS
     with Image.open(io.BytesIO(png_bytes)).convert("RGBA") as img:
         width, height = img.size
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        tile = Image.new("RGBA", (width // 2 + 200, height // 4 + 200), (0, 0, 0, 0))
-        font_size = max(18, min(width, height) // 10)
-        font = _load_font(font_size)
+        font_size = max(cfg.min_font_size, int(max(width, height) * cfg.font_scale))
+        font = _load_font(font_size, cfg)
+
+        tile_w = max(64, int(width * cfg.tile_scale_x))
+        tile_h = max(64, int(height * cfg.tile_scale_y))
+        tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(tile)
-        text_color = (0, 0, 0, 72)
-        draw.text((40, 40), text, font=font, fill=text_color)
-        rotated = tile.rotate(45, expand=True)
-        step_x = max(200, rotated.width // 2)
-        step_y = max(200, rotated.height // 2)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        color = (*cfg.color, max(16, min(255, cfg.opacity)))
+        if cfg.text_offset < 0:
+            pos_x = (tile_w - tw) // 2
+            pos_y = (tile_h - th) // 2
+        else:
+            pos_x = cfg.text_offset
+            pos_y = cfg.text_offset
+        draw.text((pos_x, pos_y), text, font=font, fill=color)
+        rotated = tile.rotate(cfg.angle, expand=True)
+
+        base_step = max(1, cfg.step)
+        step_x = max(base_step, rotated.width // 2)
+        step_y = max(base_step, rotated.height // 2)
         for x in range(-rotated.width, width + rotated.width, step_x):
             for y in range(-rotated.height, height + rotated.height, step_y):
                 overlay.alpha_composite(rotated, dest=(x, y))
@@ -700,28 +735,22 @@ def _card_keyboard(
         rows.append([InlineKeyboardButton(text="◀️ Предыдущий", callback_data="render:prev")])
         rows.append([InlineKeyboardButton(text="▶️ Следующий", callback_data="render:next")])
 
-    if render_format in ("xlsx", "docx"):
-        if selection_enabled:
-            if render_format == "xlsx":
-                select_text = "☑️ Убрать из выбора" if current_selected else "✅ Выбрать таблицу"
-            else:
-                select_text = "☑️ Убрать страницу" if current_selected else "✅ Выбрать страницу"
-            rows.append([InlineKeyboardButton(text=select_text, callback_data="render:toggle")])
-        if watermark_active:
-            rows.append([InlineKeyboardButton(text="🚫 Убрать водяной знак", callback_data="render:wm:clear")])
+    if selection_enabled:
+        if render_format == "xlsx":
+            select_text = "☑️ Убрать из выбора" if current_selected else "✅ Выбрать таблицу"
+        elif render_format == "docx":
+            select_text = "☑️ Убрать страницу" if current_selected else "✅ Выбрать страницу"
         else:
-            rows.append([InlineKeyboardButton(text="🖋️ Водяной знак", callback_data="render:wm:set")])
-        rows.append([InlineKeyboardButton(text="➕ Добавить файл", callback_data="render:add")])
-        rows.append([InlineKeyboardButton(text="▶️ Продолжить", callback_data="render:upload")])
-        rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="render:cancel")])
-        return InlineKeyboardMarkup(inline_keyboard=rows)
+            select_text = "☑️ Убрать страницу" if current_selected else "✅ Добавить страницу"
+        rows.append([InlineKeyboardButton(text=select_text, callback_data="render:toggle")])
 
     if watermark_active:
         rows.append([InlineKeyboardButton(text="🚫 Убрать водяной знак", callback_data="render:wm:clear")])
     else:
         rows.append([InlineKeyboardButton(text="🖋️ Водяной знак", callback_data="render:wm:set")])
     rows.append([InlineKeyboardButton(text="➕ Добавить файл", callback_data="render:add")])
-    rows.append([InlineKeyboardButton(text="📤 Загрузить в канал", callback_data="render:upload")])
+    upload_text = "▶️ Продолжить" if render_format in ("xlsx", "docx") else "📤 Загрузить в канал"
+    rows.append([InlineKeyboardButton(text=upload_text, callback_data="render:upload")])
     rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="render:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -770,14 +799,16 @@ def _build_caption(
             lines.append(f"Область: {table_range}")
         selected = page.get("selected", True)
         lines.append(f"Статус: {'✅ в подборке' if selected else '▫️ пропущено'}")
-    elif render_format == "docx":
+    elif render_format in {"docx", "pdf", "png"}:
         selected = page.get("selected", True)
         page_index = page.get("page_index")
         pages_total = page.get("pages_total")
-        if page_index and pages_total:
-            lines.append(f"Страница Word: {page_index}/{pages_total}")
-        elif page_index:
-            lines.append(f"Страница Word: {page_index}")
+        if render_format != "png":
+            label = "Страница Word" if render_format == "docx" else "Страница PDF"
+            if page_index and pages_total:
+                lines.append(f"{label}: {page_index}/{pages_total}")
+            elif page_index:
+                lines.append(f"{label}: {page_index}")
         lines.append(f"Статус: {'✅ в подборке' if selected else '▫️ пропущено'}")
 
     if wm_text:
@@ -804,15 +835,16 @@ def _build_caption(
                     details.append(str(table_range))
                 suffix = f" ({' — '.join(details)})" if details else ""
                 lines.append(f"• {prefix} {entry['filename']}{suffix}")
-            elif render_format == "docx":
+            elif render_format in {"docx", "pdf", "png"}:
                 prefix = "✅" if entry.get("selected", True) else "▫️"
+                details: List[str] = []
                 page_index = entry.get("page_index")
                 pages_total = entry.get("pages_total")
-                details: List[str] = []
-                if page_index and pages_total:
-                    details.append(f"стр. {page_index}/{pages_total}")
-                elif page_index:
-                    details.append(f"стр. {page_index}")
+                if render_format != "png":
+                    if page_index and pages_total:
+                        details.append(f"стр. {page_index}/{pages_total}")
+                    elif page_index:
+                        details.append(f"стр. {page_index}")
                 suffix = f" ({' — '.join(details)})" if details else ""
                 lines.append(f"• {prefix} {entry['filename']}{suffix}")
             else:
@@ -848,7 +880,7 @@ async def _update_render_card(bot, chat_id: int, state: FSMContext, *, focus: st
         preview_bytes = _ensure_preview_bytes(page, False)
 
     caption = _build_caption(items, index, total, wm_text, render_format)
-    selection_enabled = render_format in ("xlsx", "docx")
+    selection_enabled = render_format in {"xlsx", "docx", "pdf", "png"}
     current_selected = page.get("selected", True)
     keyboard = _card_keyboard(
         total,
@@ -1131,8 +1163,6 @@ async def render_file_receive(m: Message, state: FSMContext):
             analysis.get("sheets_total") if render_format == "xlsx" else "-",
         )
 
-        latest = await state.get_data()
-        items: List[Dict[str, Any]] = list(latest.get("render_items") or [])
         new_pages: List[Dict[str, Any]] = []
         for entry in pages_raw:
             page_info: Dict[str, Any] = {
@@ -1151,7 +1181,7 @@ async def render_file_receive(m: Message, state: FSMContext):
                 page_info["table_index"] = entry.get("table_index")
                 page_info["tables_in_sheet"] = entry.get("tables_in_sheet")
                 page_info["base_name"] = entry.get("base_name") or _sanitize_basename(filename)
-            elif render_format == "docx":
+            elif render_format in {"docx", "pdf", "png"}:
                 page_info["page_index"] = entry.get("page_index")
                 page_info["pages_total"] = entry.get("pages_total")
             new_pages.append(page_info)
@@ -1162,29 +1192,34 @@ async def render_file_receive(m: Message, state: FSMContext):
         }
         if render_format == "xlsx":
             new_item["sheets_total"] = analysis.get("sheets_total")
-        items.append(new_item)
 
-        wm_text = latest.get("render_wm_text")
-        if wm_text:
+        lock = _get_render_lock(m.from_user.id)
+        async with lock:
+            latest = await state.get_data()
+            items: List[Dict[str, Any]] = list(latest.get("render_items") or [])
+            items.append(new_item)
+
+            wm_text = latest.get("render_wm_text")
+            if wm_text:
+                try:
+                    await _apply_watermark_to_items([new_item], wm_text)
+                except Exception as e:
+                    logger.exception("render: watermark failed format=%s name=%s", render_format, filename)
+                    await m.answer(f"Не удалось применить водяной знак: {e}")
+
+            await state.set_state(RenderSession.idle)
+            await state.update_data(render_items=items)
+
             try:
-                await _apply_watermark_to_items([new_item], wm_text)
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            try:
+                await _update_render_card(m.bot, m.chat.id, state, focus="last")
             except Exception as e:
-                logger.exception("render: watermark failed format=%s name=%s", render_format, filename)
-                await m.answer(f"Не удалось применить водяной знак: {e}")
-
-        await state.set_state(RenderSession.idle)
-        await state.update_data(render_items=items)
-
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
-        try:
-            await _update_render_card(m.bot, m.chat.id, state, focus="last")
-        except Exception as e:
-            logger.exception("render: failed to update preview format=%s name=%s", render_format, filename)
-            await m.answer(f"Не удалось сформировать превью: {e}")
+                logger.exception("render: failed to update preview format=%s name=%s", render_format, filename)
+                await m.answer(f"Не удалось сформировать превью: {e}")
     except Exception as e:
         logger.exception("render: failed to process file format=%s name=%s size=%s", render_format, filename, file_size)
         message = f"Не удалось обработать файл: {e}"
@@ -1228,55 +1263,64 @@ async def render_pdf_add(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "render:prev")
 async def render_pdf_prev(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    items = data.get("render_items") or []
-    total = len(_flatten_pages(items))
-    if total <= 1:
-        await cq.answer()
-        return
-    index = (data.get("render_index", 0) - 1) % total
-    await state.update_data(render_index=index)
-    await _update_render_card(cq.bot, cq.message.chat.id, state)
+    lock = _get_render_lock(cq.from_user.id)
+    async with lock:
+        data = await state.get_data()
+        items = data.get("render_items") or []
+        total = len(_flatten_pages(items))
+        if total > 1:
+            index = (data.get("render_index", 0) - 1) % total
+            await state.update_data(render_index=index)
+            await _update_render_card(cq.bot, cq.message.chat.id, state)
     await cq.answer()
 
 
 @router.callback_query(F.data == "render:next")
 async def render_pdf_next(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    items = data.get("render_items") or []
-    total = len(_flatten_pages(items))
-    if total <= 1:
-        await cq.answer()
-        return
-    index = (data.get("render_index", 0) + 1) % total
-    await state.update_data(render_index=index)
-    await _update_render_card(cq.bot, cq.message.chat.id, state)
+    lock = _get_render_lock(cq.from_user.id)
+    async with lock:
+        data = await state.get_data()
+        items = data.get("render_items") or []
+        total = len(_flatten_pages(items))
+        if total > 1:
+            index = (data.get("render_index", 0) + 1) % total
+            await state.update_data(render_index=index)
+            await _update_render_card(cq.bot, cq.message.chat.id, state)
     await cq.answer()
 
 
 @router.callback_query(F.data == "render:toggle")
 async def render_toggle_selection(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    render_format = (data.get("render_format") or "pdf").lower()
-    if render_format not in {"xlsx", "docx"}:
+    response_text: str | None = None
+    show_alert = False
+    lock = _get_render_lock(cq.from_user.id)
+    async with lock:
+        data = await state.get_data()
+        render_format = (data.get("render_format") or "pdf").lower()
+        if render_format in {"xlsx", "docx", "pdf", "png"}:
+            items: List[Dict[str, Any]] = list(data.get("render_items") or [])
+            if not items:
+                response_text = "Нет элементов для выбора."
+                show_alert = True
+            else:
+                flat = _flatten_pages(items)
+                if not flat:
+                    response_text = "Нет элементов для выбора."
+                    show_alert = True
+                else:
+                    index = data.get("render_index", 0)
+                    index = max(0, min(index, len(flat) - 1))
+                    item_idx, page_idx = flat[index]
+                    page = items[item_idx]["pages"][page_idx]
+                    page["selected"] = not page.get("selected", True)
+                    await state.update_data(render_items=items)
+                    await _update_render_card(cq.bot, cq.message.chat.id, state)
+                    response_text = "Добавлено в выборку." if page["selected"] else "Исключено из выборки."
+        # если формат не поддерживает выбор, просто вернём пустой ответ
+    if response_text is None:
         await cq.answer()
-        return
-    items: List[Dict[str, Any]] = list(data.get("render_items") or [])
-    if not items:
-        await cq.answer("Нет элементов для выбора.", show_alert=True)
-        return
-    flat = _flatten_pages(items)
-    if not flat:
-        await cq.answer("Нет элементов для выбора.", show_alert=True)
-        return
-    index = data.get("render_index", 0)
-    index = max(0, min(index, len(flat) - 1))
-    item_idx, page_idx = flat[index]
-    page = items[item_idx]["pages"][page_idx]
-    page["selected"] = not page.get("selected", True)
-    await state.update_data(render_items=items)
-    await _update_render_card(cq.bot, cq.message.chat.id, state)
-    await cq.answer("Добавлено в выборку." if page["selected"] else "Исключено из выборки.")
+    else:
+        await cq.answer(response_text, show_alert=show_alert)
 
 
 @router.callback_query(F.data == "render:wm:set")
@@ -1300,42 +1344,51 @@ async def render_pdf_wm_text(m: Message, state: FSMContext):
     if not text:
         await m.answer("Текст пустой. Укажите текст для водяного знака.")
         return
-    data = await state.get_data()
-    items: List[Dict[str, Any]] = list(data.get("render_items") or [])
-    if not items:
-        await m.answer("Нет файлов для применения водяного знака.")
+    lock = _get_render_lock(m.from_user.id)
+    async with lock:
+        data = await state.get_data()
+        items: List[Dict[str, Any]] = list(data.get("render_items") or [])
+        if not items:
+            await m.answer("Нет файлов для применения водяного знака.")
+            await state.set_state(RenderSession.idle)
+            return
+        try:
+            await _apply_watermark_to_items(items, text)
+        except Exception as e:
+            await m.answer(f"Не удалось применить водяной знак: {e}")
+            await state.set_state(RenderSession.idle)
+            return
+        await state.update_data(render_items=items, render_wm_text=text)
         await state.set_state(RenderSession.idle)
-        return
-    try:
-        await _apply_watermark_to_items(items, text)
-    except Exception as e:
-        await m.answer(f"Не удалось применить водяной знак: {e}")
-        await state.set_state(RenderSession.idle)
-        return
-    await state.update_data(render_items=items, render_wm_text=text)
-    await state.set_state(RenderSession.idle)
-    await m.answer("Водяной знак добавлен.")
-    await _update_render_card(m.bot, m.chat.id, state)
+        await m.answer("Водяной знак добавлен.")
+        await _update_render_card(m.bot, m.chat.id, state)
 
 
 @router.callback_query(F.data == "render:wm:clear")
 async def render_pdf_wm_clear(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    items: List[Dict[str, Any]] = list(data.get("render_items") or [])
-    if not items:
-        await cq.answer("Нет файлов для очистки.", show_alert=True)
-        return
-    _clear_watermarks(items)
-    await state.update_data(render_items=items, render_wm_text=None)
-    await _update_render_card(cq.bot, cq.message.chat.id, state)
-    await cq.answer("Водяной знак удалён.")
+    response_text = "Водяной знак удалён."
+    show_alert = False
+    lock = _get_render_lock(cq.from_user.id)
+    async with lock:
+        data = await state.get_data()
+        items: List[Dict[str, Any]] = list(data.get("render_items") or [])
+        if not items:
+            response_text = "Нет файлов для очистки."
+            show_alert = True
+        else:
+            _clear_watermarks(items)
+            await state.update_data(render_items=items, render_wm_text=None)
+            await _update_render_card(cq.bot, cq.message.chat.id, state)
+    await cq.answer(response_text, show_alert=show_alert)
 
 
 @router.callback_query(F.data == "render:cancel")
 async def render_pdf_cancel(cq: CallbackQuery, state: FSMContext):
-    await _clear_render_context(cq.bot, cq.message.chat.id, state)
-    sent = await cq.message.answer("Выберите формат для конвертации:", reply_markup=build_render_menu_keyboard())
-    await state.update_data(menu_mid=sent.message_id)
+    lock = _get_render_lock(cq.from_user.id)
+    async with lock:
+        await _clear_render_context(cq.bot, cq.message.chat.id, state)
+        sent = await cq.message.answer("Выберите формат для конвертации:", reply_markup=build_render_menu_keyboard())
+        await state.update_data(menu_mid=sent.message_id)
     await cq.answer("Отменено.")
 
 
@@ -1347,10 +1400,15 @@ async def render_pdf_upload(cq: CallbackQuery, state: FSMContext):
         await cq.answer("Сначала добавьте файлы для конвертации.", show_alert=True)
         return
     render_format = (data.get("render_format") or "pdf").lower()
-    if render_format in {"xlsx", "docx"}:
+    if render_format in {"xlsx", "docx", "pdf", "png"}:
         has_selected = any(page.get("selected", True) for item in items for page in item["pages"])
         if not has_selected:
-            message = "Выберите хотя бы одну таблицу." if render_format == "xlsx" else "Выберите хотя бы одну страницу."
+            if render_format == "xlsx":
+                message = "Выберите хотя бы одну таблицу."
+            elif render_format == "png":
+                message = "Выберите хотя бы один файл."
+            else:
+                message = "Выберите хотя бы одну страницу."
             await cq.answer(message, show_alert=True)
             return
 
@@ -1383,10 +1441,15 @@ async def render_pdf_upload_to_channel(cq: CallbackQuery, state: FSMContext):
         await cq.answer("Нет подготовленных файлов.", show_alert=True)
         return
     render_format = (data.get("render_format") or "pdf").lower()
-    if render_format in {"xlsx", "docx"}:
+    if render_format in {"xlsx", "docx", "pdf", "png"}:
         selected_count = sum(1 for item in items for page in item["pages"] if page.get("selected", True))
         if selected_count == 0:
-            message = "Нет выбранных таблиц для отправки." if render_format == "xlsx" else "Нет выбранных страниц для отправки."
+            if render_format == "xlsx":
+                message = "Нет выбранных таблиц для отправки."
+            elif render_format == "png":
+                message = "Нет выбранных файлов для отправки."
+            else:
+                message = "Нет выбранных страниц для отправки."
             await cq.answer(message, show_alert=True)
             return
 
@@ -1414,7 +1477,7 @@ async def render_pdf_upload_to_channel(cq: CallbackQuery, state: FSMContext):
 
     for item in items:
         for page in item["pages"]:
-            if render_format in {"xlsx", "docx"} and not page.get("selected", True):
+            if render_format in {"xlsx", "docx", "pdf", "png"} and not page.get("selected", True):
                 continue
             payload = page["watermarked_bytes"] if wm_text else page["original_bytes"]
             if not payload:
