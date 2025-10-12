@@ -380,7 +380,7 @@ def _spreadsheet_to_pdf_bytes(sheet_bytes: bytes, suffix: str) -> bytes:
 
 def render_pdf_to_png_300dpi(pdf_bytes: bytes, watermark_text: str | None = None) -> bytes:
 
-    """Render first PDF page to PNG 300 DPI and apply tiled watermark."""
+    """Рендерит первую страницу PDF в PNG 300 DPI и накладывает водяной знак."""
 
     pages = _pdf_to_png_pages(pdf_bytes, watermark_text, base_name="page")
 
@@ -418,7 +418,7 @@ def process_and_publish_pdf(
 
 ) -> bool:
 
-    """Accept base64 PDF, render an image, and send to Telegram."""
+    """Принимает PDF в Base64, рендерит изображение и отправляет его в Telegram."""
 
     try:
 
@@ -438,12 +438,75 @@ def process_and_publish_pdf(
 
     except Exception as exc:
 
-        print("process_and_publish_pdf error:", exc)
+        print("Ошибка process_and_publish_pdf:", exc)
 
         return False
 
 
 
+
+
+
+
+@shared_task
+
+def process_and_publish_png(
+
+    chat_id: int,
+
+    png_b64: str,
+
+    watermark_text: str | None = None,
+
+    filename: str = "smeta.png",
+
+    apply_watermark: bool = True,
+
+) -> bool:
+
+    """Принимает PNG в Base64, при необходимости наносит водяной знак и отправляет в Telegram."""
+
+    try:
+
+        png_bytes = base64.b64decode(png_b64)
+
+        payload = png_bytes
+
+        if apply_watermark and watermark_text and str(watermark_text).strip():
+
+            with Image.open(io.BytesIO(png_bytes)).convert("RGB") as img:
+
+                stamped = apply_tiled_watermark(img, text=watermark_text, opacity=56, step=280, angle=-30)
+
+                out = io.BytesIO()
+
+                stamped.save(out, format="PNG", optimize=True, dpi=(300, 300))
+
+                payload = out.getvalue()
+
+        else:
+
+            try:
+
+                with Image.open(io.BytesIO(png_bytes)) as img:
+
+                    out = io.BytesIO()
+
+                    img.save(out, format="PNG", optimize=True, dpi=(300, 300))
+
+                    payload = out.getvalue()
+
+            except Exception:
+
+                payload = png_bytes
+
+        return bool(send_document.run(chat_id, payload, filename, caption=""))
+
+    except Exception as exc:
+
+        print("Ошибка process_and_publish_png:", exc)
+
+        return False
 
 
 @shared_task
@@ -460,7 +523,7 @@ def process_and_publish_doc(
 
 ) -> bool:
 
-    """Convert DOC/DOCX to PNG pages and send them to Telegram."""
+    """Конвертирует DOC/DOCX в PNG-страницы и отправляет их в Telegram."""
 
     try:
 
@@ -502,7 +565,7 @@ def process_and_publish_doc(
 
     except Exception as exc:
 
-        print("process_and_publish_doc error:", exc)
+        print("Ошибка process_and_publish_doc:", exc)
 
         return False
 
@@ -522,7 +585,7 @@ def process_and_publish_excel(
 
 ) -> bool:
 
-    """Convert Excel-like spreadsheets to PNG pages and send them to Telegram."""
+    """Конвертирует электронные таблицы в PNG-страницы и отправляет их в Telegram."""
 
     try:
 
@@ -552,6 +615,6 @@ def process_and_publish_excel(
 
     except Exception as exc:
 
-        print("process_and_publish_excel error:", exc)
+        print("Ошибка process_and_publish_excel:", exc)
 
         return False

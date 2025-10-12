@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import io
 import os
 import re
 import logging
 import subprocess
+import shutil
 import tempfile
 import shutil
 from pathlib import Path
@@ -42,6 +44,7 @@ from bot.handlers.menu_common import (
     BTN_RENDER_PDF,
     BTN_RENDER_DOC,
     BTN_RENDER_XLSX,
+    BTN_RENDER_PNG,
 )
 
 try:
@@ -95,6 +98,16 @@ def _convert_pdf(data: bytes, filename: str) -> List[Dict[str, Any]]:
         doc.close()
     return pages
 
+
+
+def _wrap_png_as_pages(png_bytes: bytes, filename: str) -> List[Dict[str, Any]]:
+    base_name = Path(filename).stem or "image"
+    return [{
+        "filename": f"{base_name}.png",
+        "content": png_bytes,
+        "page_index": 1,
+        "pages_total": 1,
+    }]
 
 def _convert_doc_to_pdf_bytes(doc_bytes: bytes, suffix: str) -> bytes:
     print(f"[render] _convert_doc_to_pdf_bytes start suffix={suffix} size={len(doc_bytes)}", flush=True)
@@ -150,6 +163,142 @@ def _convert_doc_to_pdf_bytes(doc_bytes: bytes, suffix: str) -> bytes:
         raise RuntimeError("LibreOffice не установлен в среде исполнения.") from e
     except subprocess.TimeoutExpired as e:
         raise RuntimeError("Конвертация LibreOffice заняла слишком много времени и была остановлена.") from e
+
+def _convert_doc_to_png_bytes(doc_bytes: bytes, suffix: str, filename: str) -> List[Dict[str, Any]]:
+    suffix = suffix.lower()
+    if suffix not in {".doc", ".docx"}:
+        raise ValueError("Only DOC and DOCX files are supported.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        src_path = tmpdir_path / f"source{suffix}"
+        src_path.write_bytes(doc_bytes)
+        pdf_path = tmpdir_path / "export.pdf"
+        png_pattern = tmpdir_path / "page-%03d.png"
+
+        binary = shutil.which("libreoffice") or shutil.which("soffice")
+        if not binary:
+            raise RuntimeError("LibreOffice binary is not available.")
+
+        safe_home = Path(tempfile.mkdtemp(prefix="lo_home_"))
+        try:
+            env = os.environ.copy()
+            env["HOME"] = str(safe_home)
+            env["TMPDIR"] = str(tmpdir_path)
+            env["SAL_USE_VCLPLUGIN"] = "headless"
+
+            pdf_cmd = [
+                binary,
+                "--headless",
+                "--nologo",
+                "--nodefault",
+                "--nofirststartwizard",
+                "--norestore",
+                "--convert-to",
+                "pdf:writer_pdf_Export:EmbedStandardFonts=true;UseTaggedPDF=false;UseLosslessCompression=true;ExportNotes=false;SkipEmptyPages=false;ExportBookmarks=false;SelectPdfVersion=1",
+                str(src_path.resolve()),
+                "--outdir",
+                str(tmpdir_path),
+            ]
+            proc_pdf = subprocess.run(
+                pdf_cmd,
+                cwd=tmpdir_path,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+            if proc_pdf.returncode != 0:
+                raise RuntimeError(
+                    "LibreOffice failed to export PDF.\n"
+                    + "Command: " + " ".join(pdf_cmd) + "\n"
+                    + f"STDOUT:\n{proc_pdf.stdout}\nSTDERR:\n{proc_pdf.stderr}"
+                )
+
+            if not pdf_path.exists():
+                candidates = sorted(tmpdir_path.glob("*.pdf"))
+                if not candidates:
+                    raise RuntimeError(
+                        "LibreOffice did not produce PDF output.\n"
+                        + "Command: " + " ".join(pdf_cmd) + "\n"
+                        + f"STDOUT:\n{proc_pdf.stdout}\nSTDERR:\n{proc_pdf.stderr}"
+                    )
+                pdf_path = candidates[0]
+            print(
+                f"[render] LibreOffice output PDF: {pdf_path.name} ({pdf_path.stat().st_size} bytes)",
+                flush=True,
+            )
+
+            gs_cmd = [
+                "gs",
+                "-dSAFER",
+                "-dBATCH",
+                "-dNOPAUSE",
+                "-dQUIET",
+                "-sDEVICE=png16m",
+                "-r300",
+                f"-sOutputFile={png_pattern}",
+                str(pdf_path),
+            ]
+            proc_gs = subprocess.run(
+                gs_cmd,
+                cwd=tmpdir_path,
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+            if proc_gs.returncode != 0:
+                raise RuntimeError(
+                    "Ghostscript failed to render PDF.\n"
+                    + "Command: " + " ".join(gs_cmd) + "\n"
+                    + f"STDOUT:\n{proc_gs.stdout}\nSTDERR:\n{proc_gs.stderr}"
+                )
+
+            png_paths = sorted(tmpdir_path.glob("page-*.png"))
+            if not png_paths:
+                raise RuntimeError(
+                    "Ghostscript did not produce PNG files.\n"
+                    + "Command: " + " ".join(gs_cmd) + "\n"
+                    + f"STDOUT:\n{proc_gs.stdout}\nSTDERR:\n{proc_gs.stderr}"
+                )
+
+            base_name = Path(filename).stem or "page"
+            pages: List[Dict[str, Any]] = []
+            total = len(png_paths)
+            for idx, path in enumerate(png_paths, start=1):
+                out_name = f"{base_name}-{idx:03}.png" if total > 1 else f"{base_name}.png"
+                pages.append({"filename": out_name, "content": path.read_bytes(), "page_index": idx, "pages_total": total})
+            return pages
+        finally:
+            shutil.rmtree(safe_home, ignore_errors=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -551,9 +700,12 @@ def _card_keyboard(
         rows.append([InlineKeyboardButton(text="◀️ Предыдущий", callback_data="render:prev")])
         rows.append([InlineKeyboardButton(text="▶️ Следующий", callback_data="render:next")])
 
-    if render_format == "xlsx":
+    if render_format in ("xlsx", "docx"):
         if selection_enabled:
-            select_text = "☑️ Убрать из выбора" if current_selected else "✅ Выбрать таблицу"
+            if render_format == "xlsx":
+                select_text = "☑️ Убрать из выбора" if current_selected else "✅ Выбрать таблицу"
+            else:
+                select_text = "☑️ Убрать страницу" if current_selected else "✅ Выбрать страницу"
             rows.append([InlineKeyboardButton(text=select_text, callback_data="render:toggle")])
         if watermark_active:
             rows.append([InlineKeyboardButton(text="🚫 Убрать водяной знак", callback_data="render:wm:clear")])
@@ -618,6 +770,15 @@ def _build_caption(
             lines.append(f"Область: {table_range}")
         selected = page.get("selected", True)
         lines.append(f"Статус: {'✅ в подборке' if selected else '▫️ пропущено'}")
+    elif render_format == "docx":
+        selected = page.get("selected", True)
+        page_index = page.get("page_index")
+        pages_total = page.get("pages_total")
+        if page_index and pages_total:
+            lines.append(f"Страница Word: {page_index}/{pages_total}")
+        elif page_index:
+            lines.append(f"Страница Word: {page_index}")
+        lines.append(f"Статус: {'✅ в подборке' if selected else '▫️ пропущено'}")
 
     if wm_text:
         lines.append(f"Водяной знак: «{wm_text}»")
@@ -641,6 +802,17 @@ def _build_caption(
                 table_range = entry.get("table_range")
                 if table_range:
                     details.append(str(table_range))
+                suffix = f" ({' — '.join(details)})" if details else ""
+                lines.append(f"• {prefix} {entry['filename']}{suffix}")
+            elif render_format == "docx":
+                prefix = "✅" if entry.get("selected", True) else "▫️"
+                page_index = entry.get("page_index")
+                pages_total = entry.get("pages_total")
+                details: List[str] = []
+                if page_index and pages_total:
+                    details.append(f"стр. {page_index}/{pages_total}")
+                elif page_index:
+                    details.append(f"стр. {page_index}")
                 suffix = f" ({' — '.join(details)})" if details else ""
                 lines.append(f"• {prefix} {entry['filename']}{suffix}")
             else:
@@ -676,7 +848,7 @@ async def _update_render_card(bot, chat_id: int, state: FSMContext, *, focus: st
         preview_bytes = _ensure_preview_bytes(page, False)
 
     caption = _build_caption(items, index, total, wm_text, render_format)
-    selection_enabled = render_format == "xlsx"
+    selection_enabled = render_format in ("xlsx", "docx")
     current_selected = page.get("selected", True)
     keyboard = _card_keyboard(
         total,
@@ -794,6 +966,23 @@ async def render_pdf_start(m: Message, state: FSMContext):
     )
 
 
+@router.message(F.text == BTN_RENDER_PNG)
+async def render_png_start(m: Message, state: FSMContext):
+    logger.info("render: start PNG session user=%s", m.from_user.id)
+    await reset_render_state(state)
+    await state.set_state(RenderSession.waiting_file)
+    await state.update_data(
+        render_format="png",
+        render_items=[],
+        render_card_mid=None,
+        render_choose_mid=None,
+        render_channels={},
+        render_index=0,
+        render_wm_text=None,
+    )
+    await m.answer("Пришлите PNG-файл как документ (до 20 МБ). Эти файлы мы можем сразу отправить в канал, добавить водяной знак и выбрать нужные страницы.")
+
+
 @router.message(F.text == BTN_RENDER_DOC)
 async def render_doc_start(m: Message, state: FSMContext):
     if not _FITZ_OK:
@@ -863,6 +1052,8 @@ async def render_file_receive(m: Message, state: FSMContext):
         default_name = "document.pdf"
     elif render_format == "docx":
         default_name = "document.docx"
+    elif render_format == "png":
+        default_name = "image.png"
     else:
         default_name = "spreadsheet.xlsx"
     filename = (doc.file_name or default_name).strip()
@@ -874,6 +1065,9 @@ async def render_file_receive(m: Message, state: FSMContext):
     if render_format == "docx" and ext not in (".doc", ".docx"):
         await m.answer("Пожалуйста, отправьте файл Word (.doc или .docx).")
         return
+    if render_format == "png" and ext != ".png":
+        await m.answer("Пожалуйста, отправьте PNG-файл.")
+        return
     if render_format == "xlsx" and ext not in (".xlsx", ".xls", ".xlsm", ".ods", ".fods"):
         await m.answer("Пожалуйста, отправьте Excel-файл (.xlsx, .xls, .ods).")
         return
@@ -881,7 +1075,14 @@ async def render_file_receive(m: Message, state: FSMContext):
         await m.answer("Обработка Excel недоступна: пакет openpyxl не установлен на сервере.")
         return
 
-    status_text = "Анализирую файл..." if render_format == "xlsx" else "Конвертируем файл..."
+    if render_format == "xlsx":
+        status_text = "Анализирую файл..."
+    elif render_format == "docx":
+        status_text = "Анализирую документ..."
+    elif render_format == "png":
+        status_text = "Обрабатываю PNG..."
+    else:
+        status_text = "Конвертируем файл..."
     status_msg = await m.answer(status_text)
     try:
         logger.info("render: downloading file format=%s name=%s size=%s", render_format, filename, file_size)
@@ -911,8 +1112,9 @@ async def render_file_receive(m: Message, state: FSMContext):
         if render_format == "pdf":
             pages_raw = await loop.run_in_executor(None, _convert_pdf, blob, filename)
         elif render_format == "docx":
-            pdf_bytes = await loop.run_in_executor(None, _convert_doc_to_pdf_bytes, blob, ext)
-            pages_raw = await loop.run_in_executor(None, _convert_pdf, pdf_bytes, filename)
+            pages_raw = await loop.run_in_executor(None, _convert_doc_to_png_bytes, blob, ext, filename)
+        elif render_format == "png":
+            pages_raw = await loop.run_in_executor(None, _wrap_png_as_pages, blob, filename)
         else:
             analysis = await loop.run_in_executor(None, _extract_excel_tables, blob, filename)
             pages_raw = list(analysis.get("pages") or [])
@@ -949,6 +1151,9 @@ async def render_file_receive(m: Message, state: FSMContext):
                 page_info["table_index"] = entry.get("table_index")
                 page_info["tables_in_sheet"] = entry.get("tables_in_sheet")
                 page_info["base_name"] = entry.get("base_name") or _sanitize_basename(filename)
+            elif render_format == "docx":
+                page_info["page_index"] = entry.get("page_index")
+                page_info["pages_total"] = entry.get("pages_total")
             new_pages.append(page_info)
 
         new_item: Dict[str, Any] = {
@@ -996,6 +1201,8 @@ async def render_file_waiting_other(m: Message, state: FSMContext):
         text = "Сейчас ожидаем Word-файл (.doc или .docx) как документ (до 20 МБ)."
     elif render_format == "xlsx":
         text = "Сейчас ожидаем Excel-файл (.xlsx, .xls, .ods) как документ (до 20 МБ)."
+    elif render_format == "png":
+        text = "Сейчас ожидаем PNG-файл как документ (до 20 МБ)."
     else:
         text = "Сейчас ожидаем PDF-файл как документ (до 20 МБ)."
     await m.answer(text)
@@ -1011,6 +1218,8 @@ async def render_pdf_add(cq: CallbackQuery, state: FSMContext):
         text = "Пришлите следующий Word-файл (.doc или .docx) как документ (до 20 МБ)."
     elif render_format == "xlsx":
         text = "Пришлите следующий Excel-файл (.xlsx, .xls, .ods) как документ (до 20 МБ)."
+    elif render_format == "png":
+        text = "Пришлите следующий PNG-файл как документ (до 20 МБ)."
     else:
         text = "Пришлите следующий PDF-файл как документ (до 20 МБ)."
     await cq.message.answer(text)
@@ -1046,19 +1255,19 @@ async def render_pdf_next(cq: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "render:toggle")
-async def render_excel_toggle(cq: CallbackQuery, state: FSMContext):
+async def render_toggle_selection(cq: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     render_format = (data.get("render_format") or "pdf").lower()
-    if render_format != "xlsx":
+    if render_format not in {"xlsx", "docx"}:
         await cq.answer()
         return
     items: List[Dict[str, Any]] = list(data.get("render_items") or [])
     if not items:
-        await cq.answer("Нет таблиц для выбора.", show_alert=True)
+        await cq.answer("Нет элементов для выбора.", show_alert=True)
         return
     flat = _flatten_pages(items)
     if not flat:
-        await cq.answer("Нет таблиц для выбора.", show_alert=True)
+        await cq.answer("Нет элементов для выбора.", show_alert=True)
         return
     index = data.get("render_index", 0)
     index = max(0, min(index, len(flat) - 1))
@@ -1138,10 +1347,11 @@ async def render_pdf_upload(cq: CallbackQuery, state: FSMContext):
         await cq.answer("Сначала добавьте файлы для конвертации.", show_alert=True)
         return
     render_format = (data.get("render_format") or "pdf").lower()
-    if render_format == "xlsx":
+    if render_format in {"xlsx", "docx"}:
         has_selected = any(page.get("selected", True) for item in items for page in item["pages"])
         if not has_selected:
-            await cq.answer("Выберите хотя бы одну таблицу.", show_alert=True)
+            message = "Выберите хотя бы одну таблицу." if render_format == "xlsx" else "Выберите хотя бы одну страницу."
+            await cq.answer(message, show_alert=True)
             return
 
     contractor_id = str(cq.from_user.id)
@@ -1173,10 +1383,11 @@ async def render_pdf_upload_to_channel(cq: CallbackQuery, state: FSMContext):
         await cq.answer("Нет подготовленных файлов.", show_alert=True)
         return
     render_format = (data.get("render_format") or "pdf").lower()
-    if render_format == "xlsx":
+    if render_format in {"xlsx", "docx"}:
         selected_count = sum(1 for item in items for page in item["pages"] if page.get("selected", True))
         if selected_count == 0:
-            await cq.answer("Нет выбранных таблиц для отправки.", show_alert=True)
+            message = "Нет выбранных таблиц для отправки." if render_format == "xlsx" else "Нет выбранных страниц для отправки."
+            await cq.answer(message, show_alert=True)
             return
 
     _, _, channel_id_str = cq.data.partition("render:ch:")
@@ -1196,21 +1407,41 @@ async def render_pdf_upload_to_channel(cq: CallbackQuery, state: FSMContext):
             await cq.answer(f"Не удалось подготовить водяной знак: {e}", show_alert=True)
             return
 
-    await cq.answer("Загружаем PNG-файлы…")
+    await cq.answer("Готовим файлы к загрузке…")
+
+    use_worker = render_format == "png"
+    celery_app = None
 
     for item in items:
         for page in item["pages"]:
-            if render_format == "xlsx" and not page.get("selected", True):
+            if render_format in {"xlsx", "docx"} and not page.get("selected", True):
                 continue
             payload = page["watermarked_bytes"] if wm_text else page["original_bytes"]
-            try:
-                await cq.bot.send_document(
-                    chat_id=channel_id,
-                    document=BufferedInputFile(payload, filename=page["filename"]),
-                    protect_content=True,
-                )
-            except Exception as e:
-                await cq.message.answer(f"Не удалось отправить {page['filename']}: {e}")
+            if not payload:
+                continue
+            filename = page.get("filename") or "smeta.png"
+            if use_worker:
+                if celery_app is None:
+                    from celery import Celery
+                    celery_app = Celery("bot", broker=os.getenv("REDIS_URL", "redis://redis:6379/0"))
+                try:
+                    encoded = base64.b64encode(payload).decode("ascii")
+                    celery_app.send_task(
+                        "tasks.render.process_and_publish_png",
+                        args=[channel_id, encoded, wm_text or "", filename],
+                        kwargs={"apply_watermark": not bool(wm_text)},
+                    )
+                except Exception as e:
+                    await cq.message.answer(f"Не удалось поставить {filename} в очередь: {e}")
+            else:
+                try:
+                    await cq.bot.send_document(
+                        chat_id=channel_id,
+                        document=BufferedInputFile(payload, filename=filename),
+                        protect_content=True,
+                    )
+                except Exception as e:
+                    await cq.message.answer(f"Не удалось отправить {filename}: {e}")
 
     choose_mid = data.get("render_choose_mid")
     if choose_mid:
@@ -1226,10 +1457,18 @@ async def render_pdf_upload_to_channel(cq: CallbackQuery, state: FSMContext):
             pass
 
     await reset_render_state(state)
-    confirmation = (
-        f"PNG файлы загружены в канал «{channel_title}». "
-        "Перейдите в раздел «🔗 Мои ссылки» для получения уникальной ссылки на канал. "
-        "В разделе «📢 Мои каналы» можете управлять уже созданными каналами."
-    )
+    if use_worker:
+        confirmation = (
+            f"PNG файлы поставлены в очередь для публикации в канал «{channel_title}». "
+            "Готовые изображения появятся в канале в течение нескольких секунд. "
+            "Перейдите в раздел «🔗 Мои ссылки» для получения уникальной ссылки на канал. "
+            "В разделе «📢 Мои каналы» можете управлять уже созданными каналами."
+        )
+    else:
+        confirmation = (
+            f"PNG файлы загружены в канал «{channel_title}». "
+            "Перейдите в раздел «🔗 Мои ссылки» для получения уникальной ссылки на канал. "
+            "В разделе «📢 Мои каналы» можете управлять уже созданными каналами."
+        )
     sent = await cq.message.answer(confirmation, reply_markup=build_render_menu_keyboard())
     await state.update_data(menu_mid=sent.message_id)

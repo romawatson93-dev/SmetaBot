@@ -2,6 +2,8 @@ FROM python:3.11-slim
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/worker
 
+ENV SAL_USE_VCLPLUGIN=headless
+
 # LibreOffice CLI + fonts for watermarking (use HTTPS mirrors to avoid blocked HTTP)
 RUN set -eux; \
     printf 'deb https://deb.debian.org/debian trixie main\n' > /etc/apt/sources.list; \

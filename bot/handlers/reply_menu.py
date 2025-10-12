@@ -21,7 +21,7 @@ from bot.handlers.menu_common import (
     BTN_PROFILE,
     BTN_HELP,
 )
-from bot.handlers.render_pdf import reset_render_state
+from bot.handlers.render_pdf import reset_render_state, render_png_start
 
 router = Router()
 
@@ -151,8 +151,8 @@ async def msg_render_back(m: Message, state: FSMContext):
 
 
 @router.message(F.text == BTN_RENDER_PNG)
-async def msg_render_png_direct(m: Message):
-    await m.answer("🖼️ Если PNG уже готов, прикрепите его как документ прямо в созданном канале.")
+async def msg_render_png_direct(m: Message, state: FSMContext):
+    await render_png_start(m, state)
 
 
 @router.message(F.text == BTN_PROFILE)
