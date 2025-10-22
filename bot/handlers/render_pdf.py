@@ -8,8 +8,9 @@ import subprocess
 import shutil
 import tempfile
 import shutil
+from threading import Lock
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiosqlite
 from aiogram import Router, F
@@ -24,6 +25,7 @@ from aiogram.types import (
 )
 from aiogram.types.input_file import BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
+from celery.exceptions import TimeoutError as CeleryTimeout
 
 try:
     import openpyxl
@@ -39,6 +41,7 @@ except Exception:  # pragma: no cover - handled by runtime fallbacks
     PageMargins = None  # type: ignore
     PageSetupProperties = None  # type: ignore
     _OPENPYXL_OK = False
+from bot.celery_client import get_celery
 from bot.handlers.menu_common import (
     build_render_menu_keyboard,
     BTN_RENDER_PDF,
@@ -62,14 +65,49 @@ except Exception:
     _PIL_OK = False
 
 from common.watermark import WATERMARK_SETTINGS, WatermarkSettings
+from bot.storage import store_blob, load_blob, delete_blob, delete_many
 
 router = Router()
 
 DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data.db"))
 MAX_FILE_SIZE = 20 * 1024 * 1024
+PREVIEW_QUEUE_NAME = os.getenv("CELERY_PREVIEW_QUEUE", "preview")
+PREVIEW_TASK_TIMEOUT = int(os.getenv("PREVIEW_TASK_TIMEOUT", "120"))
+SOURCE_PREFIXES = {
+    "pdf": "pdf",
+    "docx": "doc",
+    "xlsx": "xls",
+    "png": "png",
+}
 logger = logging.getLogger(__name__)
 
+
+def _format_error(prefix: str, exc: Exception, *, limit: int = 3500) -> str:
+    message = str(exc)
+    if len(message) > limit:
+        message = message[:limit] + "…"
+    return f"{prefix}: {message}"
+
+
+async def _release_storage_for_items(items: List[Dict[str, Any]]) -> None:
+    unique_keys: Set[str] = set()
+    for item in items:
+        source_key = item.get("source_key")
+        if source_key:
+            unique_keys.add(source_key)
+        for page in item.get("pages") or []:
+            for field in ("fullres_key", "source_key"):
+                key = page.get(field)
+                if key:
+                    unique_keys.add(key)
+    if unique_keys:
+        await delete_many(unique_keys)
+
 _RENDER_LOCKS: Dict[int, asyncio.Lock] = {}
+_USE_CELERY_PUBLISH = os.getenv("ENABLE_CELERY_PUBLISH", "1").lower() not in {"0", "false", "no"}
+_WM_TILE_CACHE_SIZE = 32
+_WM_TILE_CACHE: Dict[Tuple[str, Tuple[str, str], int, int, int, Tuple[int, int, int], int, int, int], Image.Image] = {}
+_WM_TILE_LOCK = Lock()
 
 
 def _get_render_lock(user_id: int) -> asyncio.Lock:
@@ -78,6 +116,63 @@ def _get_render_lock(user_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _RENDER_LOCKS[user_id] = lock
     return lock
+
+
+async def _ensure_page_original_bytes(page: Dict[str, Any]) -> Optional[bytes]:
+    cached = page.get("original_bytes")
+    if cached:
+        return cached
+    fullres_key = page.get("fullres_key")
+    if not fullres_key:
+        return None
+    try:
+        payload = await load_blob(fullres_key, delete=False)
+    except Exception as exc:
+        logger.warning("render: failed to load fullres page (key=%s): %s", fullres_key, exc)
+        return None
+    page["original_bytes"] = payload
+    return payload
+
+
+async def _fetch_preview_from_worker(
+    render_format: str,
+    filename: str,
+    *,
+    storage_key: str | None,
+    blob: bytes | None,
+) -> Dict[str, Any]:
+    celery_app = get_celery()
+    queue_name = PREVIEW_QUEUE_NAME
+    kwargs = {
+        "filename": filename,
+        "render_format": render_format,
+    }
+    if storage_key:
+        kwargs["file_key"] = storage_key
+    elif blob is not None:
+        kwargs["file_b64"] = base64.b64encode(blob).decode("ascii")
+    else:
+        raise RuntimeError("Preview worker requires either storage key or raw payload.")
+
+    async_result = celery_app.send_task(
+        "tasks.preview.generate_preview_task",
+        kwargs=kwargs,
+        queue=queue_name,
+    )
+    try:
+        result = await asyncio.to_thread(async_result.get, timeout=PREVIEW_TASK_TIMEOUT)
+        if not isinstance(result, dict):
+            raise RuntimeError("Неверный ответ превью-задачи.")
+        return result
+    except CeleryTimeout as exc:
+        raise RuntimeError("Превью готовится дольше обычного. Попробуйте повторить позже.") from exc
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        try:
+            async_result.forget()
+        except Exception:
+            pass
 
 ROW_GAP_TOLERANCE = 3
 
@@ -615,6 +710,62 @@ def _load_font(size: int, settings: WatermarkSettings = WATERMARK_SETTINGS) -> I
     return ImageFont.load_default()
 
 
+def _wm_cache_key(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    cfg: WatermarkSettings,
+    tile_w: int,
+    tile_h: int,
+) -> Tuple[str, Tuple[str, str], int, int, int, Tuple[int, int, int], int, int, int]:
+    font_name = font.getname()
+    font_size = getattr(font, "size", 0)
+    return (
+        text,
+        font_name,
+        font_size,
+        tile_w,
+        tile_h,
+        cfg.color,
+        cfg.opacity,
+        cfg.angle,
+        cfg.text_offset,
+    )
+
+
+def _wm_get_tile(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    cfg: WatermarkSettings,
+    tile_w: int,
+    tile_h: int,
+) -> Image.Image:
+    key = _wm_cache_key(text, font, cfg, tile_w, tile_h)
+    with _WM_TILE_LOCK:
+        cached = _WM_TILE_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
+    drawer = ImageDraw.Draw(tile)
+    bbox = drawer.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    color = (*cfg.color, max(16, min(255, cfg.opacity)))
+    if cfg.text_offset < 0:
+        pos_x = (tile_w - tw) // 2
+        pos_y = (tile_h - th) // 2
+    else:
+        pos_x = cfg.text_offset
+        pos_y = cfg.text_offset
+    drawer.text((pos_x, pos_y), text, font=font, fill=color)
+    rotated = tile.rotate(cfg.angle, expand=True)
+
+    with _WM_TILE_LOCK:
+        if len(_WM_TILE_CACHE) >= _WM_TILE_CACHE_SIZE:
+            _WM_TILE_CACHE.pop(next(iter(_WM_TILE_CACHE)))
+        _WM_TILE_CACHE[key] = rotated
+    return rotated
+
+
 def _watermark_bytes(png_bytes: bytes, text: str) -> bytes:
     if not _PIL_OK:
         raise RuntimeError("Pillow недоступен для нанесения водяного знака.")
@@ -627,19 +778,7 @@ def _watermark_bytes(png_bytes: bytes, text: str) -> bytes:
 
         tile_w = max(64, int(width * cfg.tile_scale_x))
         tile_h = max(64, int(height * cfg.tile_scale_y))
-        tile = Image.new("RGBA", (tile_w, tile_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(tile)
-        bbox = draw.textbbox((0, 0), text, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        color = (*cfg.color, max(16, min(255, cfg.opacity)))
-        if cfg.text_offset < 0:
-            pos_x = (tile_w - tw) // 2
-            pos_y = (tile_h - th) // 2
-        else:
-            pos_x = cfg.text_offset
-            pos_y = cfg.text_offset
-        draw.text((pos_x, pos_y), text, font=font, fill=color)
-        rotated = tile.rotate(cfg.angle, expand=True)
+        rotated = _wm_get_tile(text, font, cfg, tile_w, tile_h)
 
         base_step = max(1, cfg.step)
         step_x = max(base_step, rotated.width // 2)
@@ -657,12 +796,19 @@ async def _apply_watermark_to_items(items: List[Dict[str, Any]], text: str) -> N
     if not _PIL_OK:
         raise RuntimeError("Функция водяного знака недоступна (Pillow не установлен).")
 
+    for item in items:
+        for page in item["pages"]:
+            await _ensure_page_original_bytes(page)
+
     loop = asyncio.get_running_loop()
 
     def _work() -> None:
         for item in items:
             for page in item["pages"]:
-                page["watermarked_bytes"] = _watermark_bytes(page["original_bytes"], text)
+                source = page.get("original_bytes") or page.get("preview_original_bytes")
+                if not source:
+                    continue
+                page["watermarked_bytes"] = _watermark_bytes(source, text)
                 page["preview_watermarked_bytes"] = None
 
     await loop.run_in_executor(None, _work)
@@ -692,7 +838,7 @@ def _ensure_preview_bytes(page: Dict[str, Any], watermarked: bool) -> bytes | No
         target_key = "preview_watermarked_bytes"
     else:
         cached = page.get("preview_original_bytes")
-        source = page.get("original_bytes")
+        source = page.get("original_bytes") or page.get("preview_original_bytes")
         target_key = "preview_original_bytes"
 
     if cached:
@@ -939,6 +1085,7 @@ async def _clear_render_context(bot, chat_id: int, state: FSMContext) -> None:
     data = await state.get_data()
     card_mid = data.get("render_card_mid")
     choose_mid = data.get("render_choose_mid")
+    items = list(data.get("render_items") or [])
     if card_mid:
         try:
             await bot.delete_message(chat_id, card_mid)
@@ -949,6 +1096,8 @@ async def _clear_render_context(bot, chat_id: int, state: FSMContext) -> None:
             await bot.delete_message(chat_id, choose_mid)
         except Exception:
             pass
+    if items:
+        await _release_storage_for_items(items)
     for key in ("render_items", "render_card_mid", "render_choose_mid", "render_channels", "render_index", "render_wm_text"):
         data.pop(key, None)
     await state.set_data(data)
@@ -1139,55 +1288,70 @@ async def render_file_receive(m: Message, state: FSMContext):
                 blob = bytes(blob)
         logger.info("render: downloaded bytes=%s", len(blob))
 
-        loop = asyncio.get_running_loop()
-        analysis: Dict[str, Any] = {}
-        if render_format == "pdf":
-            pages_raw = await loop.run_in_executor(None, _convert_pdf, blob, filename)
-        elif render_format == "docx":
-            pages_raw = await loop.run_in_executor(None, _convert_doc_to_png_bytes, blob, ext, filename)
-        elif render_format == "png":
-            pages_raw = await loop.run_in_executor(None, _wrap_png_as_pages, blob, filename)
-        else:
-            analysis = await loop.run_in_executor(None, _extract_excel_tables, blob, filename)
-            pages_raw = list(analysis.get("pages") or [])
+        storage_key: str | None = None
+        prefix = SOURCE_PREFIXES.get(render_format, "file")
+        try:
+            storage_key = await store_blob(prefix, blob)
+            preview_result = await _fetch_preview_from_worker(
+                render_format,
+                filename,
+                storage_key=storage_key,
+                blob=blob,
+            )
+        except Exception as exc:
+            if storage_key:
+                await delete_blob(storage_key)
+            logger.exception("render: preview failed format=%s name=%s", render_format, filename)
+            await status_msg.edit_text(_format_error("Не удалось подготовить страницы", exc))
+            return
+
+        pages_raw = list(preview_result.get("pages") or [])
+        analysis = preview_result.get("analysis") or {}
         if not pages_raw:
-            if render_format == "xlsx":
-                raise RuntimeError("Не удалось определить таблицы в Excel-файле.")
-            raise RuntimeError("Документ не содержит страниц после конвертации.")
-        logger.info(
-            "render: converted format=%s name=%s bytes=%s -> pages=%s meta=%s",
-            render_format,
-            filename,
-            len(blob),
-            len(pages_raw),
-            analysis.get("sheets_total") if render_format == "xlsx" else "-",
-        )
+            if storage_key:
+                await delete_blob(storage_key)
+            raise RuntimeError("Не удалось подготовить страницы для предпросмотра.")
+
+        logger.info("render: preview ready format=%s name=%s bytes=%s -> pages=%s", render_format, filename, len(blob), len(pages_raw))
 
         new_pages: List[Dict[str, Any]] = []
         for entry in pages_raw:
+            preview_key = entry.get("preview_key")
+            if not preview_key:
+                logger.warning("render: preview key missing for %s", filename)
+                continue
+            try:
+                preview_bytes = await load_blob(preview_key, delete=True)
+            except Exception:
+                logger.warning("render: failed to load preview page for %s (key=%s)", filename, preview_key)
+                continue
+
             page_info: Dict[str, Any] = {
-                "filename": entry["filename"],
-                "original_bytes": entry["content"],
+                "filename": entry.get("filename") or filename,
+                "original_bytes": None,
                 "watermarked_bytes": None,
-                "preview_original_bytes": None,
+                "preview_original_bytes": preview_bytes,
                 "preview_watermarked_bytes": None,
                 "selected": True,
             }
-            if render_format == "xlsx":
-                page_info["sheet_name"] = entry.get("sheet_name")
-                page_info["table_range"] = entry.get("table_range")
-                page_info["sheet_index"] = entry.get("sheet_index")
-                page_info["sheets_total"] = entry.get("sheets_total")
-                page_info["table_index"] = entry.get("table_index")
-                page_info["tables_in_sheet"] = entry.get("tables_in_sheet")
-                page_info["base_name"] = entry.get("base_name") or _sanitize_basename(filename)
-            elif render_format in {"docx", "pdf", "png"}:
-                page_info["page_index"] = entry.get("page_index")
-                page_info["pages_total"] = entry.get("pages_total")
+            fullres_key = entry.get("fullres_key")
+            if fullres_key:
+                page_info["fullres_key"] = fullres_key
+
+            for key in ("sheet_name", "table_range", "sheet_index", "sheets_total", "table_index", "tables_in_sheet", "base_name", "display_name", "page_index", "pages_total"):
+                if key in entry:
+                    page_info[key] = entry[key]
+
+            if render_format == "png":
+                page_info["source_key"] = storage_key
+                if fullres_key is None and storage_key:
+                    page_info["fullres_key"] = storage_key
             new_pages.append(page_info)
 
         new_item: Dict[str, Any] = {
             "source": filename,
+            "format": render_format,
+            "source_key": storage_key,
             "pages": new_pages,
         }
         if render_format == "xlsx":
@@ -1198,6 +1362,7 @@ async def render_file_receive(m: Message, state: FSMContext):
             latest = await state.get_data()
             items: List[Dict[str, Any]] = list(latest.get("render_items") or [])
             items.append(new_item)
+            storage_key = None
 
             wm_text = latest.get("render_wm_text")
             if wm_text:
@@ -1205,7 +1370,7 @@ async def render_file_receive(m: Message, state: FSMContext):
                     await _apply_watermark_to_items([new_item], wm_text)
                 except Exception as e:
                     logger.exception("render: watermark failed format=%s name=%s", render_format, filename)
-                    await m.answer(f"Не удалось применить водяной знак: {e}")
+                    await m.answer(_format_error("Не удалось применить водяной знак", e))
 
             await state.set_state(RenderSession.idle)
             await state.update_data(render_items=items)
@@ -1221,8 +1386,13 @@ async def render_file_receive(m: Message, state: FSMContext):
                 logger.exception("render: failed to update preview format=%s name=%s", render_format, filename)
                 await m.answer(f"Не удалось сформировать превью: {e}")
     except Exception as e:
+        try:
+            if locals().get("storage_key"):
+                await delete_blob(storage_key)
+        except Exception:
+            pass
         logger.exception("render: failed to process file format=%s name=%s size=%s", render_format, filename, file_size)
-        message = f"Не удалось обработать файл: {e}"
+        message = _format_error("Не удалось обработать файл", e)
         try:
             await status_msg.edit_text(message)
         except Exception:
@@ -1355,7 +1525,7 @@ async def render_pdf_wm_text(m: Message, state: FSMContext):
         try:
             await _apply_watermark_to_items(items, text)
         except Exception as e:
-            await m.answer(f"Не удалось применить водяной знак: {e}")
+            await m.answer(_format_error("Не удалось применить водяной знак", e))
             await state.set_state(RenderSession.idle)
             return
         await state.update_data(render_items=items, render_wm_text=text)
@@ -1472,40 +1642,148 @@ async def render_pdf_upload_to_channel(cq: CallbackQuery, state: FSMContext):
 
     await cq.answer("Готовим файлы к загрузке…")
 
-    use_worker = render_format == "png"
-    celery_app = None
+    use_worker = _USE_CELERY_PUBLISH
+    celery_app = get_celery() if use_worker else None
+    publish_queue = os.getenv("CELERY_PUBLISH_QUEUE", "publish")
+    pdf_queue = os.getenv("CELERY_PDF_QUEUE", "pdf")
+    office_queue = os.getenv("CELERY_OFFICE_QUEUE", "office")
 
     for item in items:
-        for page in item["pages"]:
-            if render_format in {"xlsx", "docx", "pdf", "png"} and not page.get("selected", True):
+        item_format = str(item.get("format") or render_format).lower()
+        pages = list(item.get("pages") or [])
+        selected_pages = []
+        for idx, page in enumerate(pages, start=1):
+            if item_format in {"xlsx", "docx", "pdf", "png"} and not page.get("selected", True):
                 continue
-            payload = page["watermarked_bytes"] if wm_text else page["original_bytes"]
-            if not payload:
-                continue
-            filename = page.get("filename") or "smeta.png"
-            if use_worker:
-                if celery_app is None:
-                    from celery import Celery
-                    celery_app = Celery("bot", broker=os.getenv("REDIS_URL", "redis://redis:6379/0"))
-                try:
-                    encoded = base64.b64encode(payload).decode("ascii")
-                    celery_app.send_task(
-                        "tasks.render.process_and_publish_png",
-                        args=[channel_id, encoded, wm_text or "", filename],
-                        kwargs={"apply_watermark": not bool(wm_text)},
-                    )
-                except Exception as e:
-                    await cq.message.answer(f"Не удалось поставить {filename} в очередь: {e}")
-            else:
+            selected_pages.append((int(page.get("page_index") or idx), page))
+        if not selected_pages:
+            continue
+
+        if not use_worker:
+            fullres_cleanup: Set[str] = set()
+            for _, page in selected_pages:
+                await _ensure_page_original_bytes(page)
+                payload = None
+                if wm_text:
+                    payload = page.get("watermarked_bytes") or page.get("preview_watermarked_bytes")
+                else:
+                    payload = page.get("original_bytes") or page.get("preview_original_bytes")
+                if not payload:
+                    continue
+                filename = page.get("filename") or "smeta.png"
                 try:
                     await cq.bot.send_document(
                         chat_id=channel_id,
                         document=BufferedInputFile(payload, filename=filename),
                         protect_content=True,
                     )
+                    key_for_cleanup = page.get("fullres_key")
+                    if key_for_cleanup:
+                        fullres_cleanup.add(key_for_cleanup)
                 except Exception as e:
-                    await cq.message.answer(f"Не удалось отправить {filename}: {e}")
+                    await cq.message.answer(_format_error(f"�� 㤠���� ��ࠢ��� {filename}", e))
+            if fullres_cleanup:
+                await delete_many(fullres_cleanup)
+            await delete_blob(item.get("source_key"))
+            continue
+        if celery_app is None:
+            continue
 
+        png_pages: List[Tuple[int, Dict[str, Any], str]] = []
+        missing_pages: List[Tuple[int, Dict[str, Any]]] = []
+        for page_index, page in selected_pages:
+            fullres_key = page.get("fullres_key")
+            if fullres_key:
+                png_pages.append((page_index, page, fullres_key))
+            else:
+                missing_pages.append((page_index, page))
+
+        for _, page, fullres_key in png_pages:
+            celery_app.send_task(
+                "tasks.render.process_and_publish_png",
+                kwargs={
+                    "chat_id": channel_id,
+                    "png_key": fullres_key,
+                    "watermark_text": wm_text,
+                    "filename": page.get("filename") or "smeta.png",
+                    "apply_watermark": bool(wm_text),
+                },
+                queue=publish_queue,
+            )
+
+        if not missing_pages:
+            continue
+
+        if item_format == "png":
+            for _, page in missing_pages:
+                fallback_key = page.get("source_key") or item.get("source_key")
+                if fallback_key:
+                    celery_app.send_task(
+                        "tasks.render.process_and_publish_png",
+                        kwargs={
+                            "chat_id": channel_id,
+                            "png_key": fallback_key,
+                            "watermark_text": wm_text,
+                            "filename": page.get("filename") or "smeta.png",
+                            "apply_watermark": bool(wm_text),
+                        },
+                        queue=publish_queue,
+                    )
+                    continue
+                await _ensure_page_original_bytes(page)
+                page_bytes = page.get("original_bytes") or page.get("preview_original_bytes")
+                if not page_bytes:
+                    continue
+                encoded = base64.b64encode(page_bytes).decode("ascii")
+                celery_app.send_task(
+                    "tasks.render.process_and_publish_png",
+                    kwargs={
+                        "chat_id": channel_id,
+                        "png_b64": encoded,
+                        "watermark_text": wm_text,
+                        "filename": page.get("filename") or "smeta.png",
+                        "apply_watermark": bool(wm_text),
+                    },
+                    queue=publish_queue,
+                )
+            continue
+
+        source_key = item.get("source_key")
+        if not source_key:
+            await cq.message.answer(f"�� ������ �������� ���� ��� {item.get('source') or '���������'}.")
+            continue
+
+        page_numbers = [idx for idx, _ in missing_pages]
+        task_kwargs = {
+            "chat_id": channel_id,
+            "watermark_text": wm_text,
+            "filename": item.get("source") or "document",
+            "page_indices": page_numbers,
+        }
+
+        if item_format == "pdf":
+            task_kwargs["pdf_key"] = source_key
+            celery_app.send_task(
+                "tasks.render.process_and_publish_pdf",
+                kwargs=task_kwargs,
+                queue=pdf_queue,
+            )
+        elif item_format == "docx":
+            task_kwargs["doc_key"] = source_key
+            celery_app.send_task(
+                "tasks.render.process_and_publish_doc",
+                kwargs=task_kwargs,
+                queue=office_queue,
+            )
+        elif item_format == "xlsx":
+            task_kwargs["excel_key"] = source_key
+            celery_app.send_task(
+                "tasks.render.process_and_publish_excel",
+                kwargs=task_kwargs,
+                queue=office_queue,
+            )
+        else:
+            await cq.message.answer(f"������ {item_format} ���� �� ��������� ��� ������� ����������.")
     choose_mid = data.get("render_choose_mid")
     if choose_mid:
         try:
@@ -1535,3 +1813,4 @@ async def render_pdf_upload_to_channel(cq: CallbackQuery, state: FSMContext):
         )
     sent = await cq.message.answer(confirmation, reply_markup=build_render_menu_keyboard())
     await state.update_data(menu_mid=sent.message_id)
+

@@ -1,15 +1,17 @@
 import logging
-import os, asyncio, base64
+import os, asyncio
 import aiosqlite, httpx
 from dotenv import load_dotenv
 from bot.handlers.webapp_gate import router as webapp_gate_router
 from bot.handlers.webapp import router as webapp_router
-from bot.handlers.reply_menu import router as reply_menu_router
+from bot.handlers.menu import router as menu_router
 from bot.handlers.render_pdf import router as render_pdf_router
 from bot.handlers.channel_wizard import router as channel_wizard_router
 from bot.handlers.finalize import router as finalize_router
 from bot.handlers.my_channels import router as my_channels_router
 from bot.handlers.profile import router as profile_router
+from bot.storage import store_blob
+from bot.celery_client import get_celery
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
@@ -43,7 +45,7 @@ dp = Dispatcher(storage=MemoryStorage())
 dp.include_router(webapp_gate_router)
 dp.include_router(webapp_router)
 dp.include_router(profile_router)
-dp.include_router(reply_menu_router)
+dp.include_router(menu_router)
 dp.include_router(render_pdf_router)
 dp.include_router(channel_wizard_router)
 dp.include_router(finalize_router)
@@ -431,10 +433,6 @@ async def cmd_channels(m: Message):
 class UploadFile(StatesGroup):
     waiting_pdf = State()
 
-def _get_celery():
-    from celery import Celery
-    return Celery("bot", broker=os.getenv("REDIS_URL", "redis://redis:6379/0"))
-
 @router.callback_query(F.data == "newproj_wizard")
 async def cb_newproj_wizard(cq: CallbackQuery, state: FSMContext):
     await cb_newproj(cq, state)
@@ -472,7 +470,11 @@ async def on_pdf(m: Message, state: FSMContext):
         return
     f = await bot.get_file(doc.file_id)
     data = await bot.download_file(f.file_path)
-    pdf_b64 = base64.b64encode(data).decode("ascii")
+    try:
+        storage_key = await store_blob("pdf", data)
+    except Exception as exc:
+        await m.answer(f"Не удалось сохранить файл: {exc}")
+        return
     contractor_id = str(m.from_user.id)
     async with aiosqlite.connect(DB_PATH) as conn:
         async with conn.execute(
@@ -486,10 +488,17 @@ async def on_pdf(m: Message, state: FSMContext):
     chat_id = int(row[0])
     wm_text = m.from_user.username or str(m.from_user.id)
     out_name = os.path.splitext(filename)[0] + ".png"
-    celery_app = _get_celery()
+    celery_app = get_celery()
     celery_app.send_task(
-        "worker.tasks.render.process_and_publish_pdf",
-        args=[chat_id, pdf_b64, wm_text, out_name],
+        "tasks.render.process_and_publish_pdf",
+        kwargs={
+            "chat_id": chat_id,
+            "pdf_key": storage_key,
+            "watermark_text": wm_text,
+            "filename": filename,
+            "page_indices": [1],
+        },
+        queue=os.getenv("CELERY_PDF_QUEUE", "pdf"),
     )
     await m.answer("✅ Файл принят. PNG будет опубликован в канале после обработки.")
     await state.clear()

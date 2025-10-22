@@ -17,8 +17,7 @@ RUN set -eux; \
         fonts-dejavu-core \
         fonts-crosextra-carlito \
         fonts-crosextra-caladea \
-        fontconfig \
-        ghostscript; \
+        fontconfig; \
     fc-cache -fv; \
     rm -rf /var/lib/apt/lists/*
 
@@ -33,5 +32,6 @@ COPY worker/ /app/worker/
 
 # Run from the package directory so local imports `tasks.*` resolve
 WORKDIR /app/worker
-CMD ["bash", "-lc", "celery -A celery_app.celery worker -l info --pool=solo"]
+ENV CELERY_POOL=prefork CELERY_CONCURRENCY=3 CELERY_MAX_TASKS_PER_CHILD=100 CELERY_QUEUES=default PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus METRICS_PORT=9464
+CMD ["bash", "-lc", "mkdir -p ${PROMETHEUS_MULTIPROC_DIR}; find ${PROMETHEUS_MULTIPROC_DIR} -type f -delete; celery -A celery_app.celery worker -l info --pool=${CELERY_POOL} -c ${CELERY_CONCURRENCY} --max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD} -Q ${CELERY_QUEUES} -Ofair"]
 

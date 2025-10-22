@@ -22,6 +22,108 @@ DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data.db
 PAGE_SIZE = 6
 
 
+async def _fetch_channels(contractor_id: str, *, limit: int | None = None, search: str | None = None) -> list[tuple[int, str, int]]:
+    query = "SELECT id, title, channel_id FROM projects WHERE contractor_id=?"
+    params: list[object] = [contractor_id]
+    if search:
+        query += " AND LOWER(title) LIKE ?"
+        params.append(f"%{search.lower()}%")
+    query += " ORDER BY id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    items: list[tuple[int, str, int]] = []
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(query, tuple(params)) as cur:
+            async for row in cur:
+                chan_id = int(row[2])
+                items.append((int(row[0]), str(row[1]), chan_id))
+    return items
+
+
+async def _show_channels_list(
+    m: Message,
+    state: FSMContext,
+    *,
+    caption: str,
+    limit: int | None = None,
+    search: str | None = None,
+) -> None:
+    contractor_id = str(m.from_user.id)
+    items = await _fetch_channels(contractor_id, limit=limit, search=search)
+    if not items:
+        if search:
+            await m.answer(f"Каналы по запросу «{search}» не найдены.")
+        else:
+            await m.answer("У вас пока нет каналов. Создайте их через «Новый канал».")
+        return
+
+    titles = [title for _, title, _ in items]
+    cids = [cid for _, _, cid in items]
+    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = 0
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    kb = _page_kb(titles[start:end], cids[start:end], page, pages)
+
+    data = await state.get_data()
+    mid = data.get("channels_mid")
+    try:
+        if mid:
+            await m.bot.edit_message_text(text=caption, chat_id=m.chat.id, message_id=mid, reply_markup=kb)
+            await state.update_data(
+                channels_mid=mid,
+                channels_titles=titles,
+                channels_cids=cids,
+                channels_pages=pages,
+                channels_caption=caption,
+            )
+            return
+    except Exception:
+        pass
+
+    sent = await m.answer(caption, reply_markup=kb)
+    await state.update_data(
+        channels_mid=sent.message_id,
+        channels_titles=titles,
+        channels_cids=cids,
+        channels_pages=pages,
+        channels_caption=caption,
+    )
+
+
+async def show_all_channels(m: Message, state: FSMContext) -> None:
+    await _show_channels_list(m, state, caption="Список каналов — выберите запись:")
+
+
+async def show_recent_channels(m: Message, state: FSMContext) -> None:
+    await _show_channels_list(m, state, caption="Последние каналы — выберите запись:", limit=5)
+
+
+async def start_channels_search(m: Message, state: FSMContext) -> None:
+    await state.set_state(ChannelsSearch.waiting_query)
+    await m.answer("Введите часть названия канала:")
+
+
+async def show_channels_stats(m: Message, state: FSMContext) -> None:
+    contractor_id = str(m.from_user.id)
+    total = 0
+    last_titles: list[str] = []
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute("SELECT COUNT(*) FROM projects WHERE contractor_id=?", (contractor_id,)) as cur:
+            row = await cur.fetchone()
+            total = int(row[0]) if row and row[0] is not None else 0
+        async with conn.execute("SELECT title FROM projects WHERE contractor_id=? ORDER BY id DESC LIMIT 5", (contractor_id,)) as cur:
+            async for row in cur:
+                last_titles.append(str(row[0]))
+    lines = ["Статистика каналов:", f"- Всего каналов: {total}"]
+    if last_titles:
+        lines.append("- Последние: " + ", ".join(last_titles))
+    else:
+        lines.append("- Последние: отсутствуют")
+    await m.answer("\n".join(lines))
+
+
 def _page_kb(titles: list[str], cids: list[int], page: int, pages: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for i, (t, cid) in enumerate(zip(titles, cids)):
@@ -47,57 +149,53 @@ def _detail_kb(cid: int, page: int) -> InlineKeyboardMarkup:
 
 @router.message(Command("channels"))
 async def cmd_channels(m: Message, state: FSMContext):
-    contractor_id = str(m.from_user.id)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        items = []
-        async with conn.execute(
-            "SELECT id, title, channel_id FROM projects WHERE contractor_id=? ORDER BY id DESC",
-            (contractor_id,)
-        ) as cur:
-            async for r in cur:
-                items.append(r)
-    if not items:
-        await m.answer("Пока нет каналов. Нажмите 'Новый канал'.")
-        return
-    titles = [t for _, t, _ in items]
-    cids = [int(cid) for _, t, cid in items]
-    pages = (len(items) + PAGE_SIZE - 1) // PAGE_SIZE
-    page = 0
-    start = page*PAGE_SIZE; end = start+PAGE_SIZE
-    kb = _page_kb(titles[start:end], cids[start:end], page, pages)
-    text = "Мои каналы — выберите канал:"
-    data = await state.get_data()
-    mid = data.get("channels_mid")
-    try:
-        if mid:
-            await m.bot.edit_message_text(text=text, chat_id=m.chat.id, message_id=mid, reply_markup=kb)
-            await state.update_data(channels_titles=titles, channels_cids=cids, channels_pages=pages)
-            return
-    except Exception:
-        pass
-    sent = await m.answer(text, reply_markup=kb)
-    await state.update_data(channels_mid=sent.message_id, channels_titles=titles, channels_cids=cids, channels_pages=pages)
+    await show_all_channels(m, state)
 
 
 @router.message(F.text == "Мои каналы")
 async def msg_channels_button(m: Message, state: FSMContext):
-    await cmd_channels(m, state)
+    await show_all_channels(m, state)
 
 
 class UploadNew(StatesGroup):
     waiting_file = State()
 
 
+class ChannelsSearch(StatesGroup):
+    waiting_query = State()
+
+
+@router.message(ChannelsSearch.waiting_query)
+async def channels_search_query(m: Message, state: FSMContext):
+    query = (m.text or "").strip()
+    if not query:
+        await m.answer("Введите часть названия канала для поиска.")
+        return
+    await state.set_state(None)
+    await _show_channels_list(m, state, caption=f"Результаты поиска по «{query}»:", search=query)
+
+
 @router.callback_query(F.data.startswith("ch_page:"))
 async def cb_page(cq: CallbackQuery, state: FSMContext):
-    page = int(cq.data.split(":",1)[1])
+    page = int(cq.data.split(":", 1)[1])
     data = await state.get_data()
     titles = data.get("channels_titles", [])
     cids = data.get("channels_cids", [])
-    pages = data.get("channels_pages", 1)
-    start = page*PAGE_SIZE; end = start+PAGE_SIZE
-    kb = _page_kb(titles[start:end], cids[start:end], page, pages)
-    await cq.message.edit_text("Мои каналы — выберите канал:", reply_markup=kb)
+    pages = max(1, int(data.get("channels_pages", 1) or 1))
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    slice_titles = titles[start:end]
+    slice_cids = cids[start:end]
+    if not slice_titles and titles:
+        page = 0
+        start = 0
+        end = PAGE_SIZE
+        slice_titles = titles[start:end]
+        slice_cids = cids[start:end]
+    kb = _page_kb(slice_titles, slice_cids, page, pages)
+    caption = data.get("channels_caption", "Список каналов — выберите запись:")
+    await cq.message.edit_text(caption, reply_markup=kb)
     await cq.answer()
 
 

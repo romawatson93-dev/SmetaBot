@@ -10,6 +10,15 @@ services:
   bot:
     env_file:
       - .env.dev
-  worker:
+  worker_pdf:
+    env_file:
+      - .env.dev
+  worker_publish:
+    env_file:
+      - .env.dev
+  worker_office:
+    env_file:
+      - .env.dev
+  worker_preview:
     env_file:
       - .env.dev

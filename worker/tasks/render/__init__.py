@@ -3,11 +3,16 @@ from __future__ import annotations
 import base64
 import io
 import mimetypes
+import os
 import re
+import traceback
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
+import redis
 from celery import shared_task
+
+from common.watermark import WATERMARK_SETTINGS, WatermarkSettings
 from PIL import Image
 
 from ..publish import send_document
@@ -31,6 +36,9 @@ XLS_MIME_TYPES = {
 }
 
 _SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+_storage = redis.Redis.from_url(REDIS_URL)
 
 
 def _sanitize_basename(filename: str, default: str) -> str:
@@ -80,14 +88,23 @@ def render_to_png(file_bytes: bytes, filename: str, mime_type: str | None) -> Li
         base_name = _sanitize_basename(filename, "sheet")
         return convert_xls_to_png(file_bytes, base_name=base_name, suffix=suffix)
 
-    raise RuntimeError(f"Неподдерживаемый MIME-тип для конвертации в PNG: {mime or 'неизвестно'}")
+    raise RuntimeError(f"Unsupported MIME type for PNG conversion: {mime or 'unknown'}")
 
 
-def _apply_watermark(png_bytes: bytes, watermark_text: str | None) -> bytes:
+def _apply_watermark(
+    png_bytes: bytes,
+    watermark_text: str | None,
+    *,
+    settings: WatermarkSettings | None = None,
+) -> bytes:
     if not watermark_text or not str(watermark_text).strip():
         return png_bytes
     with Image.open(io.BytesIO(png_bytes)).convert("RGB") as img:
-        stamped = apply_tiled_watermark(img, text=str(watermark_text), opacity=56, step=280, angle=-30)
+        stamped = apply_tiled_watermark(
+            img,
+            text=str(watermark_text),
+            settings=settings or WATERMARK_SETTINGS,
+        )
         out = io.BytesIO()
         stamped.save(out, format="PNG", optimize=True)
         return out.getvalue()
@@ -96,12 +113,51 @@ def _apply_watermark(png_bytes: bytes, watermark_text: str | None) -> bytes:
 def _decode_b64(data_b64: str) -> bytes:
     try:
         return base64.b64decode(data_b64)
-    except Exception as exc:  # pragma: no cover - защитный слой
-        raise RuntimeError(f"Не удалось декодировать файл из Base64: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - invalid input
+        raise RuntimeError(f"Failed to decode Base64 payload: {exc}") from exc
 
 
 def _send_png(chat_id: int, filename: str, payload: bytes) -> bool:
     return bool(send_document.run(chat_id, payload, filename, caption=""))
+
+
+def _filter_pages(pages: List[Tuple[str, bytes]], page_indices: List[int] | None) -> List[Tuple[str, bytes]]:
+    if not page_indices:
+        return pages
+    ordered: List[Tuple[str, bytes]] = []
+    seen: set[int] = set()
+    total = len(pages)
+    for idx in page_indices:
+        if idx in seen:
+            continue
+        if idx < 1 or idx > total:
+            continue
+        ordered.append(pages[idx - 1])
+        seen.add(idx)
+    return ordered
+
+
+def _pop_storage_blob(key: str) -> bytes:
+    if not key:
+        raise RuntimeError("Storage key is empty.")
+    try:
+        pipe = _storage.pipeline()
+        pipe.get(key)
+        pipe.delete(key)
+        data, _ = pipe.execute()
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось получить файл из хранилища ({key}): {exc}") from exc
+    if data is None:
+        raise RuntimeError(f"Файл по ключу {key} не найден или уже был использован.")
+    return data
+
+
+def _resolve_payload(b64_data: Optional[str], storage_key: Optional[str], kind: str) -> bytes:
+    if storage_key:
+        return _pop_storage_blob(storage_key)
+    if b64_data:
+        return _decode_b64(b64_data)
+    raise RuntimeError(f"Не передан файл для {kind}.")
 
 
 @shared_task
@@ -109,7 +165,7 @@ def render_pdf_to_png_300dpi(pdf_bytes: bytes, watermark_text: str | None = None
     """Render the first PDF page to PNG (300 DPI)."""
     pages = render_to_png(pdf_bytes, filename="document.pdf", mime_type="application/pdf")
     if not pages:
-        raise RuntimeError("PDF не содержит страниц.")
+        raise RuntimeError("PDF has no pages.")
     _, first_page = pages[0]
     return _apply_watermark(first_page, watermark_text)
 
@@ -123,41 +179,54 @@ def render_pdf_to_jpeg_300dpi(pdf_bytes: bytes, watermark_text: str | None = Non
 @shared_task
 def process_and_publish_pdf(
     chat_id: int,
-    pdf_b64: str,
+    pdf_b64: Optional[str] = None,
+    pdf_key: Optional[str] = None,
     watermark_text: str | None = None,
-    filename: str = "smeta.png",
+    filename: str = "smeta.pdf",
+    page_indices: List[int] | None = None,
 ) -> bool:
-    """Decode a PDF, render the first page to PNG and post it to Telegram."""
+    """Decode a PDF, render selected pages to PNG and post them to Telegram."""
     try:
-        pdf_bytes = _decode_b64(pdf_b64)
+        pdf_bytes = _resolve_payload(pdf_b64, pdf_key, "PDF")
         pages = render_to_png(pdf_bytes, filename=filename or "document.pdf", mime_type="application/pdf")
         if not pages:
-            raise RuntimeError("PDF не содержит страниц.")
+            raise RuntimeError("PDF has no pages.")
 
-        name, png_bytes = pages[0]
-        payload = _apply_watermark(png_bytes, watermark_text)
-        return _send_png(chat_id, name, payload)
+        selected = _filter_pages(pages, page_indices) or [pages[0]]
+
+        ok = True
+        for name, png_bytes in selected:
+            payload = _apply_watermark(png_bytes, watermark_text)
+            if not _send_png(chat_id, name, payload):
+                ok = False
+        return ok
     except Exception as exc:
-        print("Ошибка process_and_publish_pdf:", exc)
+        print("Error in process_and_publish_pdf:", exc)
+        traceback.print_exc()
         return False
 
 
 @shared_task
 def process_and_publish_png(
     chat_id: int,
-    png_b64: str,
+    png_b64: Optional[str] = None,
+    png_key: Optional[str] = None,
     watermark_text: str | None = None,
     filename: str = "smeta.png",
     apply_watermark: bool = True,
 ) -> bool:
     """Send an existing PNG file to Telegram, optionally applying a watermark."""
     try:
-        png_bytes = _decode_b64(png_b64)
+        png_bytes = _resolve_payload(png_b64, png_key, "PNG")
         payload = png_bytes
 
         if apply_watermark and watermark_text and str(watermark_text).strip():
             with Image.open(io.BytesIO(png_bytes)).convert("RGB") as img:
-                stamped = apply_tiled_watermark(img, text=watermark_text, opacity=56, step=280, angle=-30)
+                stamped = apply_tiled_watermark(
+                    img,
+                    text=watermark_text,
+                    settings=WATERMARK_SETTINGS,
+                )
                 out = io.BytesIO()
                 stamped.save(out, format="PNG", optimize=True, dpi=(300, 300))
                 payload = out.getvalue()
@@ -172,55 +241,66 @@ def process_and_publish_png(
 
         return _send_png(chat_id, filename, payload)
     except Exception as exc:
-        print("Ошибка process_and_publish_png:", exc)
+        print("Error in process_and_publish_png:", exc)
+        traceback.print_exc()
         return False
 
 
 @shared_task
 def process_and_publish_doc(
     chat_id: int,
-    doc_b64: str,
+    doc_b64: Optional[str] = None,
+    doc_key: Optional[str] = None,
     watermark_text: str | None = None,
     filename: str = "document.docx",
+    page_indices: List[int] | None = None,
 ) -> bool:
     """Convert DOC/DOCX to PNG pages and post them to Telegram."""
     try:
-        doc_bytes = _decode_b64(doc_b64)
+        doc_bytes = _resolve_payload(doc_b64, doc_key, "DOC")
         pages = render_to_png(doc_bytes, filename=filename, mime_type=None)
         if not pages:
-            raise RuntimeError("Документ не содержит страниц.")
+            raise RuntimeError("Document has no pages.")
+
+        selected = _filter_pages(pages, page_indices) or pages
 
         ok = True
-        for name, png_bytes in pages:
+        for name, png_bytes in selected:
             payload = _apply_watermark(png_bytes, watermark_text)
             if not _send_png(chat_id, name, payload):
                 ok = False
         return ok
     except Exception as exc:
-        print("Ошибка process_and_publish_doc:", exc)
+        print("Error in process_and_publish_doc:", exc)
+        traceback.print_exc()
         return False
 
 
 @shared_task
 def process_and_publish_excel(
     chat_id: int,
-    excel_b64: str,
+    excel_b64: Optional[str] = None,
+    excel_key: Optional[str] = None,
     watermark_text: str | None = None,
     filename: str = "document.xlsx",
+    page_indices: List[int] | None = None,
 ) -> bool:
     """Convert spreadsheet documents to PNG pages and post them to Telegram."""
     try:
-        excel_bytes = _decode_b64(excel_b64)
+        excel_bytes = _resolve_payload(excel_b64, excel_key, "Excel")
         pages = render_to_png(excel_bytes, filename=filename, mime_type=None)
         if not pages:
-            raise RuntimeError("Табличный документ не содержит страниц после рендеринга.")
+            raise RuntimeError("Spreadsheet has no pages to export.")
+
+        selected = _filter_pages(pages, page_indices) or pages
 
         ok = True
-        for name, png_bytes in pages:
+        for name, png_bytes in selected:
             payload = _apply_watermark(png_bytes, watermark_text)
             if not _send_png(chat_id, name, payload):
                 ok = False
         return ok
     except Exception as exc:
-        print("Ошибка process_and_publish_excel:", exc)
+        print("Error in process_and_publish_excel:", exc)
+        traceback.print_exc()
         return False

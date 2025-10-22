@@ -13,7 +13,6 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         libreoffice-writer \
         libreoffice-calc \
-        ghostscript \
         fonts-roboto \
         fonts-dejavu-core \
         fonts-crosextra-carlito \

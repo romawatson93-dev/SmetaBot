@@ -146,16 +146,19 @@ services:
       - default
       - traefik
 
-  worker:
+  worker_pdf:
     build:
       context: .
       dockerfile: worker.Dockerfile
-    container_name: smetabot-worker
+    container_name: smetabot-worker-pdf
     env_file:
       - .env
     environment:
       TZ: ${TZ:-UTC}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      METRICS_PORT: ${WORKER_PDF_METRICS_PORT:-9464}
+      CELERY_CONCURRENCY: ${WORKER_PDF_CONCURRENCY:-3}
+      CELERY_QUEUES: ${WORKER_PDF_QUEUES:-pdf,default}
     volumes:
       - ./worker:/app/worker
     depends_on:
@@ -163,6 +166,100 @@ services:
         condition: service_healthy
       backend:
         condition: service_started
+    expose:
+      - "${WORKER_PDF_METRICS_PORT:-9464}"
+    restart: unless-stopped
+
+  worker_publish:
+    build:
+      context: .
+      dockerfile: worker.Dockerfile
+    container_name: smetabot-worker-publish
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-UTC}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      METRICS_PORT: ${WORKER_PUBLISH_METRICS_PORT:-9465}
+      CELERY_CONCURRENCY: ${WORKER_PUBLISH_CONCURRENCY:-2}
+      CELERY_QUEUES: ${WORKER_PUBLISH_QUEUES:-publish}
+    volumes:
+      - ./worker:/app/worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    expose:
+      - "${WORKER_PUBLISH_METRICS_PORT:-9465}"
+    restart: unless-stopped
+
+  worker_office:
+    build:
+      context: .
+      dockerfile: worker.Dockerfile
+    container_name: smetabot-worker-office
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-UTC}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      METRICS_PORT: ${WORKER_OFFICE_METRICS_PORT:-9466}
+      CELERY_CONCURRENCY: ${WORKER_OFFICE_CONCURRENCY:-1}
+      CELERY_QUEUES: ${WORKER_OFFICE_QUEUES:-office}
+    volumes:
+      - ./worker:/app/worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    expose:
+      - "${WORKER_OFFICE_METRICS_PORT:-9466}"
+    restart: unless-stopped
+
+  worker_preview:
+    build:
+      context: .
+      dockerfile: worker.Dockerfile
+    container_name: smetabot-worker-preview
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-UTC}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      METRICS_PORT: ${WORKER_PREVIEW_METRICS_PORT:-9467}
+      CELERY_CONCURRENCY: ${WORKER_PREVIEW_CONCURRENCY:-2}
+      CELERY_QUEUES: ${WORKER_PREVIEW_QUEUES:-preview}
+    volumes:
+      - ./worker:/app/worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    expose:
+      - "${WORKER_PREVIEW_METRICS_PORT:-9467}"
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:2.0.1
+    container_name: smetabot-flower
+    command:
+      - "celery"
+      - "--broker=${REDIS_URL:-redis://redis:6379/0}"
+      - "flower"
+      - "--port=5555"
+      - "--persistent=True"
+    environment:
+      TZ: ${TZ:-UTC}
+      FLOWER_BASIC_AUTH: ${FLOWER_BASIC_AUTH:-}
+      CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
     restart: unless-stopped
 
 volumes:

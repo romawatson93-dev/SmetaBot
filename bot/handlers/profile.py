@@ -6,7 +6,7 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
-from bot.handlers.reply_menu import reply_menu_for, userbot_get
+from bot.handlers.menu import reply_menu_for, userbot_get
 
 router = Router()
 
