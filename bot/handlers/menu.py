@@ -6,16 +6,10 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, W
 from aiogram.fsm.context import FSMContext
 
 from bot.handlers.channel_wizard import start_wizard
-from bot.handlers.my_channels import (
-    show_all_channels,
-    show_recent_channels,
-    start_channels_search,
-    show_channels_stats,
-)
+from bot.handlers.my_channels import show_channels_overview
 from bot.handlers.menu_common import (
     build_main_menu_keyboard,
     build_render_menu_keyboard,
-    build_channels_menu_keyboard,
     BTN_NEW_CHANNEL,
     BTN_MY_CHANNELS,
     BTN_MY_LINKS,
@@ -27,11 +21,6 @@ from bot.handlers.menu_common import (
     BTN_RENDER_XLSX,
     BTN_PROFILE,
     BTN_HELP,
-    BTN_CHANNELS_RECENT,
-    BTN_CHANNELS_ALL,
-    BTN_CHANNELS_SEARCH,
-    BTN_CHANNELS_STATS,
-    BTN_CHANNELS_BACK,
 )
 from bot.handlers.render_pdf import reset_render_state
 
@@ -127,39 +116,7 @@ async def act_new_channel(m: Message, state: FSMContext):
 
 @router.message(F.text.in_(CHANNELS_TRIGGERS))
 async def act_my_channels(m: Message, state: FSMContext):
-    sent = await m.answer("Раздел «Мои каналы». Выберите действие:", reply_markup=build_channels_menu_keyboard())
-    await state.update_data(channels_menu_mid=sent.message_id)
-
-
-@router.message(F.text == BTN_CHANNELS_BACK)
-async def act_channels_back(m: Message, state: FSMContext):
-    contractor_id = str(m.from_user.id)
-    try:
-        sess = await userbot_get("/session/status", {"contractor_id": contractor_id})
-        has = bool(sess.get("has_session"))
-    except Exception:
-        has = False
-    await _ensure_main_menu(m, state, has)
-
-
-@router.message(F.text == BTN_CHANNELS_ALL)
-async def act_channels_all(m: Message, state: FSMContext):
-    await show_all_channels(m, state)
-
-
-@router.message(F.text == BTN_CHANNELS_RECENT)
-async def act_channels_recent(m: Message, state: FSMContext):
-    await show_recent_channels(m, state)
-
-
-@router.message(F.text == BTN_CHANNELS_SEARCH)
-async def act_channels_search(m: Message, state: FSMContext):
-    await start_channels_search(m, state)
-
-
-@router.message(F.text == BTN_CHANNELS_STATS)
-async def act_channels_stats(m: Message, state: FSMContext):
-    await show_channels_stats(m, state)
+    await show_channels_overview(m, state)
 
 
 @router.message(F.text == BTN_MY_LINKS)

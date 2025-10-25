@@ -16,6 +16,8 @@ from common.watermark import WATERMARK_SETTINGS, WatermarkSettings
 from PIL import Image
 
 from ..publish import send_document
+from bot.services import channels as channels_service
+from bot.services import db as db_service
 from tasks.watermark import apply_tiled_watermark
 
 from .doc_to_png import convert as convert_doc_to_png
@@ -117,8 +119,40 @@ def _decode_b64(data_b64: str) -> bytes:
         raise RuntimeError(f"Failed to decode Base64 payload: {exc}") from exc
 
 
-def _send_png(chat_id: int, filename: str, payload: bytes) -> bool:
-    return bool(send_document.run(chat_id, payload, filename, caption=""))
+def _send_png(chat_id: int, filename: str, payload: bytes) -> dict[str, object] | None:
+    response = send_document.run(chat_id, payload, filename, caption="")
+    if isinstance(response, dict) and response.get("ok"):
+        return response.get("result")
+    return None
+
+
+async def _record_publication_async(
+    chat_id: int,
+    filename: str,
+    message_payload: dict[str, object],
+    source_document_id: int | None = None,
+) -> None:
+    await db_service.init_pool()
+    document = message_payload.get("document") if isinstance(message_payload, dict) else None
+    await channels_service.record_channel_file(
+        channel_id=chat_id,
+        message_id=int(message_payload.get("message_id")),
+        filename=filename,
+        file_type=(document or {}).get("mime_type"),
+        caption=message_payload.get("caption"),
+        views=int(message_payload.get("views", 0) or 0),
+        posted_at=None,
+        source_document_id=source_document_id,
+    )
+
+
+def _record_publication(chat_id: int, filename: str, message_payload: dict[str, object] | None, source_document_id: int | None = None) -> None:
+    if not message_payload:
+        return
+    try:
+        asyncio.run(_record_publication_async(chat_id, filename, message_payload, source_document_id))
+    except Exception as exc:  # pragma: no cover - best effort
+        print("Failed to record publication metadata:", exc)
 
 
 def _filter_pages(pages: List[Tuple[str, bytes]], page_indices: List[int] | None) -> List[Tuple[str, bytes]]:
@@ -197,8 +231,11 @@ def process_and_publish_pdf(
         ok = True
         for name, png_bytes in selected:
             payload = _apply_watermark(png_bytes, watermark_text)
-            if not _send_png(chat_id, name, payload):
+            message_payload = _send_png(chat_id, name, payload)
+            if not message_payload:
                 ok = False
+            else:
+                _record_publication(chat_id, name, message_payload)
         return ok
     except Exception as exc:
         print("Error in process_and_publish_pdf:", exc)
@@ -239,7 +276,11 @@ def process_and_publish_png(
             except Exception:
                 payload = png_bytes
 
-        return _send_png(chat_id, filename, payload)
+        message_payload = _send_png(chat_id, filename, payload)
+        if message_payload:
+            _record_publication(chat_id, filename, message_payload)
+            return True
+        return False
     except Exception as exc:
         print("Error in process_and_publish_png:", exc)
         traceback.print_exc()
@@ -267,8 +308,11 @@ def process_and_publish_doc(
         ok = True
         for name, png_bytes in selected:
             payload = _apply_watermark(png_bytes, watermark_text)
-            if not _send_png(chat_id, name, payload):
+            message_payload = _send_png(chat_id, name, payload)
+            if not message_payload:
                 ok = False
+            else:
+                _record_publication(chat_id, name, message_payload)
         return ok
     except Exception as exc:
         print("Error in process_and_publish_doc:", exc)
@@ -297,8 +341,11 @@ def process_and_publish_excel(
         ok = True
         for name, png_bytes in selected:
             payload = _apply_watermark(png_bytes, watermark_text)
-            if not _send_png(chat_id, name, payload):
+            message_payload = _send_png(chat_id, name, payload)
+            if not message_payload:
                 ok = False
+            else:
+                _record_publication(chat_id, name, message_payload)
         return ok
     except Exception as exc:
         print("Error in process_and_publish_excel:", exc)

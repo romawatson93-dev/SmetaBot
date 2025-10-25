@@ -24,6 +24,10 @@ RUN set -eux; \
 COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy shared bot services so worker can reuse database layer
+COPY bot/__init__.py /app/bot/__init__.py
+COPY bot/services/ /app/bot/services/
+
 # Shared utilities (watermark config, etc.)
 COPY common/ /app/common/
 

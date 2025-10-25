@@ -10,7 +10,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 logger = logging.getLogger(__name__)
 
 @shared_task
-def send_document(chat_id: int, file_bytes: bytes, filename: str = "smeta.png", caption: str = "") -> bool:
+def send_document(chat_id: int, file_bytes: bytes, filename: str = "smeta.png", caption: str = "") -> dict[str, object] | None:
     """Send bytes to Telegram as a document (protect_content=True).
 
     Retries transient errors (e.g., channel not ready, bot rights not yet propagated)
@@ -43,7 +43,11 @@ def send_document(chat_id: int, file_bytes: bytes, filename: str = "smeta.png", 
                 response.raise_for_status()
             duration = time.monotonic() - start
             record_publish("success", duration, attempt - 1, payload_size)
-            return True
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {"ok": False}
+            return payload if isinstance(payload, dict) else {"ok": False}
         except Exception:  # pragma: no cover - network path
             logger.exception("send_document exception attempt=%d", attempt)
             if attempt < len(backoff) + 1:
@@ -51,9 +55,8 @@ def send_document(chat_id: int, file_bytes: bytes, filename: str = "smeta.png", 
                 continue
             duration = time.monotonic() - start
             record_publish("failure", duration, attempt - 1, payload_size)
-            return False
+            return None
 
-    # Fallback in case loop exits unexpectedly
     duration = time.monotonic() - start
     record_publish("failure", duration, len(backoff), payload_size)
-    return False
+    return None

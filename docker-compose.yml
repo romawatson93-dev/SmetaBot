@@ -44,6 +44,8 @@ services:
       timeout: 5s
       retries: 6
     restart: unless-stopped
+    ports:
+    - "5432:5432"
 
   redis:
     image: redis:7.2-alpine

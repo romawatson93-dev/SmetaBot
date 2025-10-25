@@ -12,7 +12,6 @@ from threading import Lock
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import aiosqlite
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -26,6 +25,8 @@ from aiogram.types import (
 from aiogram.types.input_file import BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 from celery.exceptions import TimeoutError as CeleryTimeout
+
+from bot.services import channels as channels_service
 
 try:
     import openpyxl
@@ -69,7 +70,6 @@ from bot.storage import store_blob, load_blob, delete_blob, delete_many
 
 router = Router()
 
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data.db"))
 MAX_FILE_SIZE = 20 * 1024 * 1024
 PREVIEW_QUEUE_NAME = os.getenv("CELERY_PREVIEW_QUEUE", "preview")
 PREVIEW_TASK_TIMEOUT = int(os.getenv("PREVIEW_TASK_TIMEOUT", "120"))
@@ -1114,13 +1114,13 @@ async def reset_render_state(state: FSMContext) -> None:
 
 async def _fetch_recent_channels(contractor_id: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute(
-            "SELECT channel_id, title FROM projects WHERE contractor_id=? ORDER BY id DESC LIMIT 5",
-            (contractor_id,),
-        ) as cur:
-            async for channel_id, title in cur:
-                rows.append({"channel_id": int(channel_id), "title": title})
+    try:
+        contractor_id_int = int(contractor_id)
+    except ValueError:
+        contractor_id_int = int(contractor_id or 0)
+    channels = await channels_service.list_channels(contractor_id_int, limit=5)
+    for item in channels:
+        rows.append({"channel_id": int(item["channel_id"]), "title": item["title"]})
     return rows
 
 

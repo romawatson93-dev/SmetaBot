@@ -1,340 +1,356 @@
-import os
-import aiosqlite
-from aiogram import Router, F
-from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputFile
-from aiogram import Bot
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.types.input_file import BufferedInputFile
+from __future__ import annotations
 
-try:
-    import fitz  # PyMuPDF
-    _FITZ_OK = True
-except Exception:
-    _FITZ_OK = False
-import base64 as _b64
+from typing import Any, Dict, List, Optional
+
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from bot.services import channels as channels_service
 
 router = Router()
 
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data.db"))
-
-PAGE_SIZE = 6
-
-
-async def _fetch_channels(contractor_id: str, *, limit: int | None = None, search: str | None = None) -> list[tuple[int, str, int]]:
-    query = "SELECT id, title, channel_id FROM projects WHERE contractor_id=?"
-    params: list[object] = [contractor_id]
-    if search:
-        query += " AND LOWER(title) LIKE ?"
-        params.append(f"%{search.lower()}%")
-    query += " ORDER BY id DESC"
-    if limit is not None:
-        query += " LIMIT ?"
-        params.append(limit)
-    items: list[tuple[int, str, int]] = []
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute(query, tuple(params)) as cur:
-            async for row in cur:
-                chan_id = int(row[2])
-                items.append((int(row[0]), str(row[1]), chan_id))
-    return items
-
-
-async def _show_channels_list(
-    m: Message,
-    state: FSMContext,
-    *,
-    caption: str,
-    limit: int | None = None,
-    search: str | None = None,
-) -> None:
-    contractor_id = str(m.from_user.id)
-    items = await _fetch_channels(contractor_id, limit=limit, search=search)
-    if not items:
-        if search:
-            await m.answer(f"Каналы по запросу «{search}» не найдены.")
-        else:
-            await m.answer("У вас пока нет каналов. Создайте их через «Новый канал».")
-        return
-
-    titles = [title for _, title, _ in items]
-    cids = [cid for _, _, cid in items]
-    pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = 0
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    kb = _page_kb(titles[start:end], cids[start:end], page, pages)
-
-    data = await state.get_data()
-    mid = data.get("channels_mid")
-    try:
-        if mid:
-            await m.bot.edit_message_text(text=caption, chat_id=m.chat.id, message_id=mid, reply_markup=kb)
-            await state.update_data(
-                channels_mid=mid,
-                channels_titles=titles,
-                channels_cids=cids,
-                channels_pages=pages,
-                channels_caption=caption,
-            )
-            return
-    except Exception:
-        pass
-
-    sent = await m.answer(caption, reply_markup=kb)
-    await state.update_data(
-        channels_mid=sent.message_id,
-        channels_titles=titles,
-        channels_cids=cids,
-        channels_pages=pages,
-        channels_caption=caption,
-    )
-
-
-async def show_all_channels(m: Message, state: FSMContext) -> None:
-    await _show_channels_list(m, state, caption="Список каналов — выберите запись:")
-
-
-async def show_recent_channels(m: Message, state: FSMContext) -> None:
-    await _show_channels_list(m, state, caption="Последние каналы — выберите запись:", limit=5)
-
-
-async def start_channels_search(m: Message, state: FSMContext) -> None:
-    await state.set_state(ChannelsSearch.waiting_query)
-    await m.answer("Введите часть названия канала:")
-
-
-async def show_channels_stats(m: Message, state: FSMContext) -> None:
-    contractor_id = str(m.from_user.id)
-    total = 0
-    last_titles: list[str] = []
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute("SELECT COUNT(*) FROM projects WHERE contractor_id=?", (contractor_id,)) as cur:
-            row = await cur.fetchone()
-            total = int(row[0]) if row and row[0] is not None else 0
-        async with conn.execute("SELECT title FROM projects WHERE contractor_id=? ORDER BY id DESC LIMIT 5", (contractor_id,)) as cur:
-            async for row in cur:
-                last_titles.append(str(row[0]))
-    lines = ["Статистика каналов:", f"- Всего каналов: {total}"]
-    if last_titles:
-        lines.append("- Последние: " + ", ".join(last_titles))
-    else:
-        lines.append("- Последние: отсутствуют")
-    await m.answer("\n".join(lines))
-
-
-def _page_kb(titles: list[str], cids: list[int], page: int, pages: int) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for i, (t, cid) in enumerate(zip(titles, cids)):
-        rows.append([InlineKeyboardButton(text=f"📣 {t}", callback_data=f"ch_sel:{page}:{i}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"ch_page:{page-1}"))
-    nav.append(InlineKeyboardButton(text=f"Стр. {page+1}/{pages}", callback_data="noop"))
-    if page+1 < pages:
-        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"ch_page:{page+1}"))
-    rows.append(nav)
-    rows.append([InlineKeyboardButton(text="Закрыть", callback_data="ch_close")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _detail_kb(cid: int, page: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Открыть", callback_data=f"ch_open:{cid}:{page}")],
-        [InlineKeyboardButton(text="Инвайт", callback_data=f"ch_inv:{cid}:{page}"), InlineKeyboardButton(text="Новая версия", callback_data=f"ch_new:{cid}:{page}")],
-        [InlineKeyboardButton(text="← Список", callback_data=f"ch_page:{page}"), InlineKeyboardButton(text="Закрыть", callback_data="ch_close")],
-    ])
-
-
-@router.message(Command("channels"))
-async def cmd_channels(m: Message, state: FSMContext):
-    await show_all_channels(m, state)
-
-
-@router.message(F.text == "Мои каналы")
-async def msg_channels_button(m: Message, state: FSMContext):
-    await show_all_channels(m, state)
-
-
-class UploadNew(StatesGroup):
-    waiting_file = State()
+MENU_PREFIX = "chmenu"
+CHANNEL_PAGE_SIZE = 6
 
 
 class ChannelsSearch(StatesGroup):
     waiting_query = State()
 
 
+def _overview_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗂 Последние 5 каналов", callback_data=f"{MENU_PREFIX}:recent")],
+            [InlineKeyboardButton(text="📋 Все каналы", callback_data=f"{MENU_PREFIX}:all:0")],
+            [InlineKeyboardButton(text="🔍 Поиск по названию", callback_data=f"{MENU_PREFIX}:search")],
+        ]
+    )
+
+
+def _format_overview_text(stats: Dict[str, Any]) -> str:
+    lines = [
+        "📊 Статистика каналов:",
+        f"• Количество каналов: {stats.get('total_channels', 0)}",
+        f"• Опубликованных файлов: {stats.get('total_files', 0)}",
+        f"• Суммарные просмотры: {stats.get('total_views', 0)}",
+    ]
+    recent = stats.get("recent_titles") or []
+    if recent:
+        lines.append("")
+        lines.append("🗂 Последние каналы:")
+        for title in recent:
+            lines.append(f"  • {title}")
+    return "\n".join(lines)
+
+
+async def _ensure_card(
+    *,
+    bot: Bot,
+    state: FSMContext,
+    chat_id: int,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+    message: Optional[Message] = None,
+) -> None:
+    data = await state.get_data()
+    current_mid = data.get("channels_card_mid")
+
+    if message and current_mid == message.message_id:
+        try:
+            await message.edit_text(text, reply_markup=keyboard)
+            await state.update_data(channels_card_mid=message.message_id)
+            return
+        except TelegramBadRequest:
+            pass
+
+    if current_mid:
+        try:
+            await bot.edit_message_text(text=text, chat_id=chat_id, message_id=current_mid, reply_markup=keyboard)
+            return
+        except TelegramBadRequest:
+            try:
+                await bot.delete_message(chat_id, current_mid)
+            except Exception:
+                pass
+
+    sent = await bot.send_message(chat_id, text, reply_markup=keyboard)
+    await state.update_data(channels_card_mid=sent.message_id)
+
+
+async def _fetch_channels(
+    contractor_id: int,
+    *,
+    limit: Optional[int] = None,
+    search: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    rows = await channels_service.list_channels(
+        contractor_id,
+        limit=limit or 100,
+        search=search,
+    )
+    return [
+        {
+            "project_id": row["project_id"],
+            "title": row["title"],
+            "channel_id": int(row["channel_id"]),
+        }
+        for row in rows
+    ]
+
+
+async def _collect_overview_stats(contractor_id: int) -> Dict[str, Any]:
+    aggregate = await channels_service.aggregate_contractor_stats(contractor_id)
+    recent = await channels_service.list_channels(contractor_id, limit=5)
+    aggregate["recent_titles"] = [row["title"] for row in recent]
+    return aggregate
+
+
+async def show_channels_overview(cq: CallbackQuery, state: FSMContext) -> None:
+    contractor_id_int = cq.from_user.id
+    stats = await _collect_overview_stats(contractor_id_int)
+    text = _format_overview_text(stats)
+    keyboard = _overview_keyboard()
+    await _ensure_card(
+        bot=cq.message.bot,
+        state=state,
+        chat_id=cq.message.chat.id,
+        text=text,
+        keyboard=keyboard,
+        message=cq.message,
+    )
+    await state.update_data(channels_view={"type": "overview"})
+    await cq.answer()
+
+
+async def show_recent_channels_view(cq: CallbackQuery, state: FSMContext) -> None:
+    contractor_id_int = cq.from_user.id
+    items = await _fetch_channels(contractor_id_int, limit=5)
+    if not items:
+        text = "Каналы отсутствуют."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{MENU_PREFIX}:main")]])
+    else:
+        text_lines = ["🗂 Последние каналы:", ""]
+        for item in items:
+            text_lines.append(f"• {item['title']}")
+        text = "\n".join(text_lines)
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"📂 {item['title']}", callback_data=f"{MENU_PREFIX}:detail:{item['project_id']}:recent:0")]
+                for item in items
+            ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{MENU_PREFIX}:main")]]
+        )
+    await _ensure_card(
+        bot=cq.message.bot,
+        state=state,
+        chat_id=cq.message.chat.id,
+        text=text,
+        keyboard=keyboard,
+        message=cq.message,
+    )
+    await state.update_data(channels_view={"type": "recent"})
+    await cq.answer()
+
+
+async def show_all_channels_view(cq: CallbackQuery, state: FSMContext, page: int = 0) -> None:
+    contractor_id_int = cq.from_user.id
+    items = await _fetch_channels(contractor_id_int, limit=500)
+    if not items:
+        text = "Каналы отсутствуют."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{MENU_PREFIX}:main")]])
+    else:
+        total_pages = max(1, (len(items) + CHANNEL_PAGE_SIZE - 1) // CHANNEL_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        start = page * CHANNEL_PAGE_SIZE
+        subset = items[start : start + CHANNEL_PAGE_SIZE]
+
+        text_lines = [f"📋 Все каналы — страница {page + 1}/{total_pages}", ""]
+        text_lines.extend(f"• {item['title']}" for item in subset)
+        text = "\n".join(text_lines)
+
+        rows: List[List[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text=f"📂 {item['title']}", callback_data=f"{MENU_PREFIX}:detail:{item['project_id']}:all:{page}")]
+            for item in subset
+        ]
+        if total_pages > 1:
+            nav_row: List[InlineKeyboardButton] = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"{MENU_PREFIX}:all:{page - 1}"))
+            nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data=f"{MENU_PREFIX}:noop"))
+            if page + 1 < total_pages:
+                nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"{MENU_PREFIX}:all:{page + 1}"))
+            rows.append(nav_row)
+        rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data=f"{MENU_PREFIX}:main")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    await _ensure_card(
+        bot=cq.message.bot,
+        state=state,
+        chat_id=cq.message.chat.id,
+        text=text,
+        keyboard=keyboard,
+        message=cq.message,
+    )
+    await state.update_data(channels_view={"type": "all", "page": page})
+    await cq.answer()
+
+
+async def start_channels_search_inline(cq: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ChannelsSearch.waiting_query)
+    text = "🔍 Поиск по названию. Отправьте часть названия канала."
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{MENU_PREFIX}:main")]])
+    await _ensure_card(
+        bot=cq.message.bot,
+        state=state,
+        chat_id=cq.message.chat.id,
+        text=text,
+        keyboard=keyboard,
+        message=cq.message,
+    )
+    await state.update_data(channels_view={"type": "search"})
+    await cq.answer("Введите поисковый запрос в чат")
+
+
+async def _get_channel_detail(project_id: int) -> Optional[Dict[str, Any]]:
+    channel = await channels_service.get_channel_by_project(project_id)
+    if not channel:
+        return None
+    stats = await channels_service.get_channel_stats(int(channel["channel_id"]))
+    return stats
+
+
+async def _format_channel_detail(bot: Bot, info: Dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
+    project_id = info.get("project_id")
+    title = info.get("title") or info.get("project_title") or "Канал"
+    channel_id = int(info["channel_id"])
+
+    lines = [
+        "📌 Информация о канале:",
+        f"• Название: {title}",
+        f"• ID: {channel_id}",
+    ]
+    if info.get("username"):
+        lines.append(f"• Username: @{info['username']}")
+    if info.get("type"):
+        lines.append(f"• Тип: {info['type']}")
+    if info.get("created_at"):
+        lines.append(f"• Создан: {info['created_at']:%Y-%m-%d %H:%M:%S}")
+    if info.get("first_message_at"):
+        lines.append(f"• Первый пост: {info['first_message_at']:%Y-%m-%d %H:%M:%S}")
+
+    lines.append(f"• Опубликованных файлов: {info.get('files_count', 0)}")
+    lines.append(f"• Суммарные просмотры: {info.get('views_total', 0)}")
+
+    lines.append("")
+    lines.append("Участники (администраторы):")
+    try:
+        admins = await bot.get_chat_administrators(channel_id)
+        for admin in admins:
+            user = admin.user
+            username = f"@{user.username}" if user.username else "без username"
+            lines.append(f"  • {user.full_name} ({username}, id={user.id})")
+    except (TelegramBadRequest, TelegramForbiddenError, TelegramNotFound):
+        lines.append("  • недоступно")
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Перейти в канал", callback_data=f"{MENU_PREFIX}:goto:{project_id}")],
+            [InlineKeyboardButton(text="✏️ Редактировать канал", callback_data=f"{MENU_PREFIX}:edit:{project_id}")],
+            [InlineKeyboardButton(text="📎 Добавить/удалить файлы", callback_data=f"{MENU_PREFIX}:files:{project_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{MENU_PREFIX}:main")],
+        ]
+    )
+    return "\n".join(lines), keyboard
+
+
+async def show_channel_detail_view(cq: CallbackQuery, state: FSMContext, project_id: int) -> None:
+    info = await _get_channel_detail(project_id)
+    if not info:
+        await cq.answer("Канал не найден", show_alert=True)
+        return
+    text, keyboard = await _format_channel_detail(cq.message.bot, info)
+    await _ensure_card(
+        bot=cq.message.bot,
+        state=state,
+        chat_id=cq.message.chat.id,
+        text=text,
+        keyboard=keyboard,
+        message=cq.message,
+    )
+    await state.update_data(channels_view={"type": "detail", "project_id": project_id})
+    await cq.answer()
+
+
 @router.message(ChannelsSearch.waiting_query)
-async def channels_search_query(m: Message, state: FSMContext):
+async def handle_search_query(m: Message, state: FSMContext) -> None:
     query = (m.text or "").strip()
     if not query:
-        await m.answer("Введите часть названия канала для поиска.")
+        await m.answer("Введите непустой запрос.")
         return
     await state.set_state(None)
-    await _show_channels_list(m, state, caption=f"Результаты поиска по «{query}»:", search=query)
+    contractor_id_int = m.from_user.id
+    items = await _fetch_channels(contractor_id_int, search=query, limit=50)
+    if not items:
+        text = f"Результаты поиска по «{query}» отсутствуют."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{MENU_PREFIX}:main")]])
+    else:
+        text_lines = [f"🔍 Результаты поиска по «{query}»:"] + [f"• {item['title']}" for item in items]
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"📂 {item['title']}", callback_data=f"{MENU_PREFIX}:detail:{item['project_id']}:search:0")]
+                for item in items
+            ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{MENU_PREFIX}:main")]]
+        )
+        text = "\n".join(text_lines)
+    await _ensure_card(
+        bot=m.bot,
+        state=state,
+        chat_id=m.chat.id,
+        text=text,
+        keyboard=keyboard,
+    )
+    await state.update_data(channels_view={"type": "search_results", "query": query})
 
 
-@router.callback_query(F.data.startswith("ch_page:"))
-async def cb_page(cq: CallbackQuery, state: FSMContext):
-    page = int(cq.data.split(":", 1)[1])
-    data = await state.get_data()
-    titles = data.get("channels_titles", [])
-    cids = data.get("channels_cids", [])
-    pages = max(1, int(data.get("channels_pages", 1) or 1))
-    page = max(0, min(page, pages - 1))
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    slice_titles = titles[start:end]
-    slice_cids = cids[start:end]
-    if not slice_titles and titles:
-        page = 0
-        start = 0
-        end = PAGE_SIZE
-        slice_titles = titles[start:end]
-        slice_cids = cids[start:end]
-    kb = _page_kb(slice_titles, slice_cids, page, pages)
-    caption = data.get("channels_caption", "Список каналов — выберите запись:")
-    await cq.message.edit_text(caption, reply_markup=kb)
-    await cq.answer()
-
-
-@router.callback_query(F.data.startswith("ch_sel:"))
-async def cb_select(cq: CallbackQuery, state: FSMContext):
-    _, page, idx = cq.data.split(":")
-    page = int(page); idx = int(idx)
-    data = await state.get_data()
-    titles = data.get("channels_titles", [])
-    cids = data.get("channels_cids", [])
-    abs_index = page*PAGE_SIZE + idx
-    if abs_index >= len(cids):
-        await cq.answer("Не найдено", show_alert=True); return
-    cid = cids[abs_index]; title = titles[abs_index]
-    text = f"Проект: {title}\nВыберите действие:"
-    await cq.message.edit_text(text, reply_markup=_detail_kb(cid, page))
-    await cq.answer()
-
-
-@router.callback_query(F.data.startswith("ch_open:"))
-async def cb_open(cq: CallbackQuery, bot: Bot):
+@router.callback_query(F.data.startswith(f"{MENU_PREFIX}:"))
+async def channels_menu_callback(cq: CallbackQuery, state: FSMContext) -> None:
     parts = cq.data.split(":")
-    cid = int(parts[1]); page = int(parts[2]) if len(parts) > 2 else 0
-    try:
-        link = await bot.create_chat_invite_link(chat_id=cid, name="Open", creates_join_request=False)
-        await cq.message.edit_text(f"Ссылка для открытия:\n{link.invite_link}", reply_markup=_detail_kb(cid, page))
-    except Exception as e:
-        await cq.answer(f"Не удалось получить ссылку: {e}", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("ch_inv:"))
-async def cb_inv(cq: CallbackQuery, bot: Bot):
-    parts = cq.data.split(":")
-    cid = int(parts[1]); page = int(parts[2]) if len(parts)>2 else 0
-    try:
-        link = await bot.create_chat_invite_link(chat_id=cid, name="Invite", creates_join_request=True)
-        await cq.message.edit_text(f"🔗 Инвайт (join-request):\n{link.invite_link}\n👤 Разрешённых заявок: 1", reply_markup=_detail_kb(cid, page))
-    except Exception as e:
-        await cq.answer(f"Не удалось создать ссылку: {e}", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("ch_new:"))
-async def cb_new(cq: CallbackQuery, state: FSMContext):
-    parts = cq.data.split(":")
-    cid = int(parts[1]); page = int(parts[2]) if len(parts)>2 else 0
-    await state.set_state(UploadNew.waiting_file)
-    await state.update_data(target_chat_id=cid, back_page=page)
-    await cq.message.edit_text("Пришлите PDF/XLSX. Мы конвертируем в PNG 300 DPI с водяным знаком и опубликуем в канале.")
-    await cq.answer()
-
-
-@router.message(UploadNew.waiting_file, F.document)
-async def on_new_file(m: Message, state: FSMContext):
-    data = await state.get_data()
-    cid = int(data.get("target_chat_id"))
-    back_page = int(data.get("back_page", 0))
-    doc = m.document
-    filename = doc.file_name or "file.pdf"
-    f = await m.bot.get_file(doc.file_id)
-    raw = await m.bot.download_file(f.file_path)
-    wm_text = (m.from_user.username or str(m.from_user.id))
-    out_name = filename.rsplit(".",1)[0] + ".png"
-
-    # Превью для PDF (первая страница, 150 DPI)
-    if filename.lower().endswith(".pdf") and _FITZ_OK:
-        try:
-            doc_pdf = fitz.open(stream=raw, filetype="pdf")
-            page = doc_pdf[0]
-            zoom = 150/72.0
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            preview = pix.tobytes("png")
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Опубликовать", callback_data="prev_pub"), InlineKeyboardButton(text="Отмена", callback_data="prev_cancel")]])
-            sent = await m.answer_photo(BufferedInputFile(preview, filename="preview.png"), caption=f"Превью 1/{doc_pdf.page_count} — Опубликовать?", reply_markup=kb)
-            await state.update_data(preview_mid=sent.message_id, file_b64=_b64.b64encode(raw).decode("ascii"), target_chat_id=cid, wm_text=wm_text, out_name=out_name, back_page=back_page)
+    action = parts[1]
+    if action == "main":
+        await show_channels_overview(cq, state)
+    elif action == "recent":
+        await show_recent_channels_view(cq, state)
+    elif action == "all":
+        page = int(parts[2]) if len(parts) > 2 else 0
+        await show_all_channels_view(cq, state, page)
+    elif action == "search":
+        await start_channels_search_inline(cq, state)
+    elif action == "detail":
+        project_id = int(parts[2])
+        await show_channel_detail_view(cq, state, project_id)
+    elif action == "goto":
+        project_id = int(parts[2])
+        channel = await channels_service.get_channel_by_project(project_id)
+        if not channel:
+            await cq.answer("Канал недоступен", show_alert=True)
             return
-        except Exception:
-            pass
-
-    # Нет превью — сразу предложим публикацию
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Опубликовать", callback_data="prev_pub"), InlineKeyboardButton(text="Отмена", callback_data="prev_cancel")]])
-    sent = await m.answer("Превью недоступно. Опубликовать в канал?", reply_markup=kb)
-    await state.update_data(preview_mid=sent.message_id, file_b64=_b64.b64encode(raw).decode("ascii"), target_chat_id=cid, wm_text=wm_text, out_name=out_name, back_page=back_page)
-
-
-@router.callback_query(F.data == "prev_cancel")
-async def cb_prev_cancel(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    back_page = int(data.get("back_page", 0))
-    cid = int(data.get("target_chat_id"))
-    await state.clear()
-    await cq.message.edit_text("Отменено.", reply_markup=_detail_kb(cid, back_page))
-    await cq.answer()
-
-
-@router.callback_query(F.data == "prev_pub")
-async def cb_prev_pub(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    b64 = data.get("file_b64"); cid = int(data.get("target_chat_id")); wm_text = data.get("wm_text") or ""; out_name = data.get("out_name") or "smeta.png"
-    back_page = int(data.get("back_page", 0))
-    # Тонкий прогресс
-    try:
-        await cq.message.edit_caption(caption="⏳ Публикую в канал…", reply_markup=None)
-    except Exception:
+        channel_id = int(channel["channel_id"])
+        title = channel.get("title") or "Канал"
         try:
-            await cq.message.edit_text("⏳ Публикую в канал…", reply_markup=None)
-        except Exception:
-            pass
-    from celery import Celery
-    celery_app = Celery("bot", broker=os.getenv("REDIS_URL", "redis://redis:6379/0"))
-    celery_app.send_task("tasks.render.process_and_publish_pdf", args=[cid, b64, wm_text, out_name])
-    try:
-        await cq.message.edit_caption(caption="✅ Отправлено. Готовые PNG появятся в канале через ~5 сек.")
-    except Exception:
-        try:
-            await cq.message.edit_text("✅ Отправлено. Готовые PNG появятся в канале через ~5 сек.")
-        except Exception:
-            pass
-    await state.clear()
-    # Вернёмся в карточку канала
-    await cq.message.edit_text("Готово.", reply_markup=_detail_kb(cid, back_page))
-    await cq.answer()
-
-
-@router.message(F.document)
-async def on_new_file_fallback(m: Message, state: FSMContext):
-    data = await state.get_data()
-    if not data.get("target_chat_id"):
-        return
-    await on_new_file(m, state)
-
-
-@router.callback_query(F.data == "ch_close")
-async def cb_close(cq: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    mid = data.get("channels_mid")
-    if mid:
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
-    await state.update_data(channels_mid=None)
-    await cq.answer()
+            chat = await cq.bot.get_chat(channel_id)
+            if chat.username:
+                url = f"https://t.me/{chat.username}"
+            else:
+                url = await cq.bot.export_chat_invite_link(channel_id)
+            await cq.message.answer(f"Ссылка на канал {title}:\n{url}")
+            await cq.answer()
+        except Exception as exc:
+            await cq.answer(f"Не удалось получить ссылку: {exc}", show_alert=True)
+    elif action in {"edit", "files"}:
+        await cq.answer("Функция находится в разработке", show_alert=True)
+    elif action == "noop":
+        await cq.answer()
+    else:
+        await cq.answer("Неизвестное действие", show_alert=True)

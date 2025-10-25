@@ -13,11 +13,6 @@ BTN_RENDER_DOC = "📝 Word → PNG"
 BTN_RENDER_PNG = "🖼️ PNG в канал"
 BTN_RENDER_BACK = "⬅️ Назад"
 
-BTN_CHANNELS_RECENT = "🕔 Последние 5 каналов"
-BTN_CHANNELS_ALL = "📋 Все каналы"
-BTN_CHANNELS_SEARCH = "🔍 Поиск по названию"
-BTN_CHANNELS_STATS = "📊 Статистика"
-BTN_CHANNELS_BACK = "⬅️ Назад"
 
 
 def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -39,11 +34,3 @@ def build_render_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def build_channels_menu_keyboard() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(text=BTN_CHANNELS_RECENT)],
-        [KeyboardButton(text=BTN_CHANNELS_ALL)],
-        [KeyboardButton(text=BTN_CHANNELS_SEARCH), KeyboardButton(text=BTN_CHANNELS_STATS)],
-        [KeyboardButton(text=BTN_CHANNELS_BACK)],
-    ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)

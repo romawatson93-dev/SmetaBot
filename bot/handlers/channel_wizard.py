@@ -1,20 +1,24 @@
-import os
 import html
-import aiosqlite
+import os
+
 import httpx
-from aiogram import Router, F, Bot
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.types.input_file import BufferedInputFile
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types.input_file import BufferedInputFile
+
+from bot.services import channels as channels_service
+from bot.services import profiles as profiles_service
+from bot.services import projects as projects_service
 
 router = Router()
 INVITES_CACHE: dict[int, str] = {}
 INVITES_CACHE: dict[int, str] = {}
 
 USERBOT_URL = os.getenv("USERBOT_URL", "http://userbot:8001")
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data.db"))
 
 
 async def userbot_post(path: str, json=None):
@@ -234,48 +238,36 @@ async def on_any_document(m: Message, state: FSMContext):
 
 async def _execute_job(bot: Bot, user_id: int, d: dict) -> tuple[int | None, str]:
     contractor_id = str(user_id)
+    contractor_id_int = user_id
     title = d.get('title') or f"Канал {user_id}"
     avatar_state = d.get('avatar_state')
     avatar_bytes = d.get('avatar_bytes') if avatar_state == 'added' else None
     if (not avatar_bytes) and avatar_state == 'std':
-        # Pull standard avatar from profile storage, if present
         try:
-            async with aiosqlite.connect(DB_PATH) as conn:
-                await conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS profiles(
-                      contractor_id TEXT PRIMARY KEY,
-                      std_avatar BLOB
-                    )
-                    """
-                )
-                async with conn.execute("SELECT std_avatar FROM profiles WHERE contractor_id=?", (contractor_id,)) as cur:
-                    row = await cur.fetchone()
-                    if row and row[0]:
-                        avatar_bytes = row[0]
+            profile = await profiles_service.get_avatar(contractor_id_int)
+            if profile and profile.get('std_avatar'):
+                avatar_bytes = profile['std_avatar']
         except Exception:
             avatar_bytes = None
 
-    # 1) Создать канал от имени userbot и выдать боту права
     r = await userbot_post("/rooms/create", {"contractor_id": contractor_id, "title": title})
-    channel_id = int(r["channel_id"])  # Telethon id
+    channel_id = int(r["channel_id"])
     chat_id = int(f"-100{abs(channel_id)}")
-    me = await bot.get_me(); bot_username = me.username if me.username.startswith('@') else f"@{me.username}"
+    me = await bot.get_me()
+    bot_username = me.username if me.username.startswith('@') else f"@{me.username}"
     await userbot_post("/rooms/add_bot_admin", {"contractor_id": contractor_id, "channel_id": channel_id, "bot_username": bot_username})
 
-    # 2) Поставить аватарку (если выбрана)
     if avatar_bytes:
         import asyncio
-        # Небольшая пауза, чтобы применились права change_info и сам канал стал доступен
         await asyncio.sleep(1.5)
         try:
             await bot.set_chat_photo(chat_id=chat_id, photo=BufferedInputFile(avatar_bytes, filename="avatar.jpg"))
+            avatar_tag = "custom"
         except Exception as e:
             try:
                 print(f"[wizard] set_chat_photo failed: {e}")
             except Exception:
                 pass
-            # Fallback: set photo via userbot client API right after creation (с паузой)
             try:
                 import asyncio, base64 as _b64
                 await asyncio.sleep(2.0)
@@ -284,21 +276,36 @@ async def _execute_job(bot: Bot, user_id: int, d: dict) -> tuple[int | None, str
                     "channel_id": channel_id,
                     "photo_b64": _b64.b64encode(avatar_bytes).decode("ascii"),
                 })
+                avatar_tag = "custom"
             except Exception as e2:
                 try:
                     print(f"[wizard] userbot set_photo failed: {e2}")
                 except Exception:
                     pass
+                avatar_tag = None
+    else:
+        avatar_tag = None
 
-    # 3) Сохранить проект в локальную БД
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("INSERT INTO projects(contractor_id, title, channel_id) VALUES(?,?,?)", (contractor_id, title, chat_id))
-        await conn.commit()
+    chat = None
+    try:
+        chat = await bot.get_chat(chat_id)
+    except TelegramForbiddenError:
+        chat = None
+    record = await channels_service.create_project_channel(
+        contractor_id=contractor_id_int,
+        title=title,
+        channel_id=chat_id,
+        username=getattr(chat, 'username', None) if chat else None,
+        channel_type=getattr(chat, 'type', None) if chat else None,
+        avatar_file=avatar_tag,
+    )
+    project = record.get('project') if record else None
 
-    # 4) Одноразовая бессрочная ссылка (1 человек)
     try:
         link = await bot.create_chat_invite_link(chat_id=chat_id, name=f"Invite for {title}", member_limit=1)
         invite = link.invite_link
+        if project:
+            await projects_service.create_invite(project['id'], invite, allowed=1)
     except Exception as e:
         invite = f"Не удалось создать ссылку: {e}"
 
