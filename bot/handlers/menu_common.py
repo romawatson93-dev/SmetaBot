@@ -4,6 +4,7 @@ BTN_NEW_CHANNEL = "🆕 Новый канал"
 BTN_MY_CHANNELS = "📢 Мои каналы"
 BTN_MY_LINKS = "🔗 Мои ссылки"
 BTN_RENDER = "🖼️ Рендер файлов"
+BTN_SUBSCRIPTION = "🧾 Моя подписка"
 BTN_PROFILE = "👤 Личный кабинет"
 BTN_HELP = "❓ Помощь"
 
@@ -20,7 +21,7 @@ def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_NEW_CHANNEL)],
         [KeyboardButton(text=BTN_MY_CHANNELS), KeyboardButton(text=BTN_MY_LINKS)],
         [KeyboardButton(text=BTN_RENDER), KeyboardButton(text=BTN_PROFILE)],
-        [KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BTN_SUBSCRIPTION), KeyboardButton(text=BTN_HELP)],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 

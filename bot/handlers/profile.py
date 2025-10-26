@@ -9,7 +9,7 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from bot.handlers.menu import reply_menu_for, userbot_get
 from bot.handlers.menu_common import BTN_PROFILE
 import bot.services.channels as channels_service
-import bot.services.profiles as profiles_service
+import bot.services.contractors as contractors_service
 
 router = Router()
 

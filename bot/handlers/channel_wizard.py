@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.types.input_file import BufferedInputFile
 
 import bot.services.channels as channels_service
-import bot.services.profiles as profiles_service
+import bot.services.contractors as contractors_service
 import bot.services.projects as projects_service
 
 router = Router()

@@ -18,6 +18,8 @@ from bot.handlers.channel_wizard import router as channel_wizard_router
 
 from bot.handlers.finalize import router as finalize_router
 
+from bot.handlers.subscription import router as subscription_router
+
 from bot.handlers.my_channels import router as my_channels_router
 
 from bot.handlers.profile import router as profile_router
@@ -103,6 +105,8 @@ dp.include_router(menu_router)
 dp.include_router(render_pdf_router)
 
 dp.include_router(channel_wizard_router)
+
+dp.include_router(subscription_router)
 
 dp.include_router(finalize_router)
 

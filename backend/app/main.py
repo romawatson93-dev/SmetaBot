@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from app.routers import yookassa as yookassa_router
+
 
 app = FastAPI(title="SmetaBot Backend", version="0.1.0")
 
@@ -8,6 +10,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
+
+app.include_router(yookassa_router.router, prefix="/api")
 
 @app.get("/health")
 async def health():
