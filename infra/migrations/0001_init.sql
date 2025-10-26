@@ -11,19 +11,20 @@ SET client_min_messages = warning;
 -- =====================================================================
 DO $$
 DECLARE
-    schema_name TEXT;
+    sname TEXT;
 BEGIN
-    FOR schema_name IN ('core', 'billing', 'analytics', 'referrals', 'admin')
+    FOR sname IN
+        SELECT unnest(ARRAY['core', 'billing', 'analytics', 'referrals', 'admin'])
     LOOP
         IF EXISTS (
-            SELECT 1
-            FROM information_schema.schemata
-            WHERE schema_name = schema_name
+            SELECT 1 FROM information_schema.schemata WHERE schemata.schema_name = sname
         ) THEN
-            EXECUTE format('DROP SCHEMA %I CASCADE;', schema_name);
+            EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE;', sname);
         END IF;
     END LOOP;
 END $$;
+
+
 
 -- =====================================================================
 -- 1. Создание схем
@@ -200,6 +201,76 @@ CREATE TABLE analytics.events (
     ))
 );
 
+-- =====================================================================
+-- 5. REFERRALS
+-- =====================================================================
+
+CREATE TABLE referrals.referral_links (
+    contractor_id  BIGINT UNIQUE NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
+    token          TEXT UNIQUE NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE referrals.referrals (
+    id                       BIGSERIAL PRIMARY KEY,
+    referrer_id              BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
+    referred_contractor_id   BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (referrer_id, referred_contractor_id)
+);
+
+CREATE TABLE referrals.referral_cycles (
+    id                        BIGSERIAL PRIMARY KEY,
+    referrer_id               BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
+    cycle_no                  INT NOT NULL,
+    qualified_refs_required   INT NOT NULL DEFAULT 3,
+    qualified_refs_done       INT NOT NULL DEFAULT 0,
+    state                     TEXT NOT NULL DEFAULT 'in_progress',
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at              TIMESTAMPTZ,
+    UNIQUE (referrer_id, cycle_no),
+    CHECK (state IN ('in_progress','completed','reward_queued'))
+);
+
+-- =====================================================================
+-- 6. ADMIN
+-- =====================================================================
+
+CREATE TABLE admin.admin_users (
+    id         BIGSERIAL PRIMARY KEY,
+    tg_user_id BIGINT UNIQUE NOT NULL,
+    username   TEXT,
+    role       TEXT NOT NULL,
+    is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+    added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (role IN ('support','manager','owner'))
+);
+
+CREATE TABLE admin.admin_actions (
+    id           BIGSERIAL PRIMARY KEY,
+    admin_id     BIGINT NOT NULL REFERENCES admin.admin_users(id) ON DELETE CASCADE,
+    action       TEXT NOT NULL,
+    target_type  TEXT,
+    target_id    BIGINT,
+    payload      JSONB,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Сначала создаём базовую вьюху по рефералке
+CREATE OR REPLACE VIEW referrals.referral_progress AS
+SELECT
+    r.id AS referral_id,
+    r.referrer_id,
+    r.referred_contractor_id,
+    COUNT(DISTINCT ch.id) AS channels_created,
+    CASE
+        WHEN COUNT(DISTINCT ch.id) >= 2 THEN TRUE
+        ELSE FALSE
+    END AS qualified
+FROM referrals.referrals r
+LEFT JOIN core.channels ch ON ch.contractor_id = r.referred_contractor_id
+GROUP BY r.id, r.referrer_id, r.referred_contractor_id;
+
 -- Представление: профиль пользователя
 CREATE OR REPLACE VIEW analytics.profile_overview AS
 WITH subs AS (
@@ -323,69 +394,6 @@ LEFT JOIN qual  ON qual.contractor_id  = co.id
 LEFT JOIN cycle ON cycle.contractor_id = co.id
 LEFT JOIN gifts ON gifts.contractor_id = co.id;
 
--- =====================================================================
--- 5. REFERRALS
--- =====================================================================
-
-CREATE TABLE referrals.referral_links (
-    contractor_id  BIGINT UNIQUE NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
-    token          TEXT UNIQUE NOT NULL,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE referrals.referrals (
-    id                       BIGSERIAL PRIMARY KEY,
-    referrer_id              BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
-    referred_contractor_id   BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
-    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (referrer_id, referred_contractor_id)
-);
-
-CREATE TABLE referrals.referral_progress (
-    id                       BIGSERIAL PRIMARY KEY,
-    referrer_id              BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
-    referred_contractor_id   BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
-    channels_created         INT NOT NULL DEFAULT 0,
-    qualified                BOOLEAN NOT NULL DEFAULT FALSE,
-    UNIQUE (referrer_id, referred_contractor_id)
-);
-
-CREATE TABLE referrals.referral_cycles (
-    id                        BIGSERIAL PRIMARY KEY,
-    referrer_id               BIGINT NOT NULL REFERENCES core.contractors(id) ON DELETE CASCADE,
-    cycle_no                  INT NOT NULL,
-    qualified_refs_required   INT NOT NULL DEFAULT 3,
-    qualified_refs_done       INT NOT NULL DEFAULT 0,
-    state                     TEXT NOT NULL DEFAULT 'in_progress',
-    created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at              TIMESTAMPTZ,
-    UNIQUE (referrer_id, cycle_no),
-    CHECK (state IN ('in_progress','completed','reward_queued'))
-);
-
--- =====================================================================
--- 6. ADMIN
--- =====================================================================
-
-CREATE TABLE admin.admin_users (
-    id         BIGSERIAL PRIMARY KEY,
-    tg_user_id BIGINT UNIQUE NOT NULL,
-    username   TEXT,
-    role       TEXT NOT NULL,
-    is_active  BOOLEAN NOT NULL DEFAULT TRUE,
-    added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (role IN ('support','manager','owner'))
-);
-
-CREATE TABLE admin.admin_actions (
-    id           BIGSERIAL PRIMARY KEY,
-    admin_id     BIGINT NOT NULL REFERENCES admin.admin_users(id) ON DELETE CASCADE,
-    action       TEXT NOT NULL,
-    target_type  TEXT,
-    target_id    BIGINT,
-    payload      JSONB,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
 -- =====================================================================
 -- 7. Индексы для analytics/gifts (дополнительные)

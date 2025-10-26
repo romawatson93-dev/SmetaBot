@@ -10,9 +10,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.types.input_file import BufferedInputFile
 
-from bot.services import channels as channels_service
-from bot.services import profiles as profiles_service
-from bot.services import projects as projects_service
+import bot.services.channels as channels_service
+import bot.services.profiles as profiles_service
+import bot.services.projects as projects_service
 
 router = Router()
 INVITES_CACHE: dict[int, str] = {}

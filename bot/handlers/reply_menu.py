@@ -6,8 +6,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from bot.services import channels as channels_service
-from bot.services import projects as projects_service
+import bot.services.channels as channels_service
+import bot.services.projects as projects_service
 
 from bot.handlers.menu_common import (
     build_main_menu_keyboard,

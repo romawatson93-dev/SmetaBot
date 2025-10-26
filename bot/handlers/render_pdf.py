@@ -26,7 +26,7 @@ from aiogram.types.input_file import BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 from celery.exceptions import TimeoutError as CeleryTimeout
 
-from bot.services import channels as channels_service
+import bot.services.channels as channels_service
 
 try:
     import openpyxl

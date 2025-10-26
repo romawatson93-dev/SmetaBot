@@ -8,8 +8,8 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 
 from bot.handlers.menu import reply_menu_for, userbot_get
 from bot.handlers.menu_common import BTN_PROFILE
-from bot.services import channels as channels_service
-from bot.services import profiles as profiles_service
+import bot.services.channels as channels_service
+import bot.services.profiles as profiles_service
 
 router = Router()
 

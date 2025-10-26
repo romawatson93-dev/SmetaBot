@@ -5,8 +5,8 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.services import channels as channels_service
-from bot.services import projects as projects_service
+import bot.services.channels as channels_service
+import bot.services.projects as projects_service
 
 router = Router()
 
