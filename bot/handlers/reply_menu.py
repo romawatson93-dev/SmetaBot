@@ -7,7 +7,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 import bot.services.channels as channels_service
-import bot.services.projects as projects_service
+import bot.services.contractors as contractors_service
+import bot.services.invites as invites_service
 
 from bot.handlers.menu_common import (
     build_main_menu_keyboard,
@@ -106,7 +107,7 @@ async def msg_invite(m: Message, bot: Bot):
 
     channel_id = int(latest["channel_id"])
     title = latest.get("title") or "Канал"
-    project_id = latest.get("project_id")
+    channel_db_id = latest.get("id")  # ID канала в БД (core.channels)
     try:
         link = await bot.create_chat_invite_link(
             chat_id=channel_id,
@@ -115,8 +116,10 @@ async def msg_invite(m: Message, bot: Bot):
             expire_date=None,
             member_limit=0,
         )
-        if project_id is not None:
-            await projects_service.create_invite(project_id, link.invite_link, allowed=1)
+        if channel_db_id is not None:
+            # Извлекаем только токен из полной ссылки
+            token = link.invite_link.split('/')[-1] if '/' in link.invite_link else link.invite_link
+            await invites_service.create_invite(channel_id=int(channel_db_id), token=token, max_uses=1)
         await m.answer(f"🔗 Приглашение (join-request):\n{link.invite_link}\n✅ Ограничение: 1 заявка.")
     except Exception as e:
         await m.answer(f"⚠️ Не удалось создать приглашение: {e}")

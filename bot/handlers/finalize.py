@@ -6,12 +6,12 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
 import bot.services.channels as channels_service
-import bot.services.projects as projects_service
+import bot.services.contractors as contractors_service
+import bot.services.invites as invites_service
 
 router = Router()
 
 USERBOT_URL = os.getenv("USERBOT_URL", "http://userbot:8001")
-INVITES_CACHE: dict[int, str] = {}
 
 
 async def userbot_post(path: str, json=None):
@@ -53,18 +53,19 @@ async def finalize_with_progress(cq: CallbackQuery, bot: Bot):
         username=getattr(chat, "username", None) if chat else None,
         channel_type=getattr(chat, "type", None) if chat else None,
     )
-    project = record.get("project") if record else None
+    channel_db = record.get("channel") if record else None
 
     await cq.message.edit_text("✅ Канал создан\n✅ Бот добавлен админом\n✅ Проект сохранён\n⏳ Генерирую ссылку…")
     try:
         link = await bot.create_chat_invite_link(chat_id=chat_id, name=f"Invite for {title}", member_limit=1)
         invite = link.invite_link
-        if project:
-            await projects_service.create_invite(project["id"], invite, allowed=1)
+        if channel_db:
+            # Извлекаем только токен из полной ссылки
+            token = invite.split('/')[-1] if '/' in invite else invite
+            await invites_service.create_invite(channel_id=int(channel_db['id']), token=token, max_uses=1)
     except Exception as exc:
         invite = f"Не удалось создать ссылку: {exc}"
 
-    INVITES_CACHE[uid] = invite
     report = f"✅ Канал создан\n\nСсылка (бессрочная, 1 человек):\n{invite}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -80,9 +81,13 @@ async def finalize_with_progress(cq: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "cw:copy_invite")
 async def copy_invite(cq: CallbackQuery):
-    invite = INVITES_CACHE.get(cq.from_user.id)
-    if not invite:
-        await cq.answer("Ссылка недоступна", show_alert=True)
+    # Получаем последний канал и ищем активную ссылку
+    contractor_id_int = cq.from_user.id
+    latest = await channels_service.get_latest_channel(contractor_id_int)
+    if not latest:
+        await cq.answer("Канал не найден", show_alert=True)
         return
-    await cq.message.answer(f"Ссылка:\n<code>{invite}</code>", parse_mode="HTML", disable_web_page_preview=True)
-    await cq.answer("Ссылка отправлена")
+    
+    channel_id = int(latest["channel_id"])
+    # Здесь можно добавить логику получения ссылки из БД или создания новой
+    await cq.answer("Используйте раздел '🔗 Мои ссылки' для управления приглашениями")

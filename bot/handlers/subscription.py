@@ -67,7 +67,7 @@ async def _subscription_card_text(user_id: int) -> str:
 
     # Дополнительно: счётчики (если есть в analytics).
     overview = await db.fetchrow(
-        "SELECT * FROM analytics.profile_overview WHERE contractor_id = %s",
+        "SELECT * FROM analytics.profile_overview WHERE contractor_id = $1",
         (user_id,)
     )
     channels_total = overview.get("channels_total") if overview else None

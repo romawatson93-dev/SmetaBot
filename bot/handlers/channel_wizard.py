@@ -12,11 +12,11 @@ from aiogram.types.input_file import BufferedInputFile
 
 import bot.services.channels as channels_service
 import bot.services.contractors as contractors_service
-import bot.services.projects as projects_service
+import bot.services.invites as invites_service
+import bot.services.profiles as profiles_service
+
 
 router = Router()
-INVITES_CACHE: dict[int, str] = {}
-INVITES_CACHE: dict[int, str] = {}
 
 USERBOT_URL = os.getenv("USERBOT_URL", "http://userbot:8001")
 
@@ -166,25 +166,117 @@ async def on_title(m: Message, state: FSMContext):
 @router.message(StateFilter(CreateChannel.input_avatar), F.photo)
 async def on_avatar_photo(m: Message, state: FSMContext):
     print("[wizard] on_avatar_photo")
+    # Защита от спама: проверяем количество уже загруженных фото
+    d = await state.get_data()
+    upload_count = d.get('avatar_upload_count', 0)
+    if upload_count >= 3:
+        await m.answer("❌ Превышен лимит попыток загрузки (3). Выберите 'Пропустить' или 'Стандартная'.")
+        return
+    
     photo = m.photo[-1]
-    f = await m.bot.get_file(photo.file_id)
-    data = await m.bot.download_file(f.file_path)
+    
+    # Проверяем размер файла (макс 10 МБ)
+    if photo.file_size and photo.file_size > 10 * 1024 * 1024:
+        await m.answer("❌ Файл слишком большой (макс. 10 МБ). Отправьте меньший размер.")
+        return
+    
     try:
-        # aiogram returns BytesIO; convert to bytes
+        f = await m.bot.get_file(photo.file_id)
+        data = await m.bot.download_file(f.file_path)
         if hasattr(data, 'read'):
             data = data.read()
-    except Exception:
-        pass
-    await state.update_data(avatar_state='added', avatar_bytes=data, step=2)
+    except Exception as e:
+        print(f"[wizard] photo download error: {e}")
+        await m.answer("❌ Ошибка загрузки фото. Попробуйте ещё раз.")
+        return
+    
+    await state.update_data(avatar_state='added', avatar_bytes=data, step=2, avatar_upload_count=upload_count + 1)
     await _render_card(m.bot, m.chat.id, state, None, _kb_final())
+    await m.answer("✅ Аватарка загружена!")
+
+
+@router.message(StateFilter(CreateChannel.input_avatar), F.document)
+async def on_avatar_document(m: Message, state: FSMContext):
+    print("[wizard] on_avatar_document")
+    # Защита от спама
+    d = await state.get_data()
+    upload_count = d.get('avatar_upload_count', 0)
+    if upload_count >= 3:
+        await m.answer("❌ Превышен лимит попыток загрузки (3). Выберите 'Пропустить' или 'Стандартная'.")
+        return
+    
+    doc = m.document
+    
+    # Проверяем размер (макс 10 МБ)
+    if doc.file_size and doc.file_size > 10 * 1024 * 1024:
+        await m.answer("❌ Файл слишком большой (макс. 10 МБ). Отправьте меньший размер.")
+        return
+    
+    # Проверяем формат (только JPEG/PNG)
+    allowed_mimes = {'image/jpeg', 'image/png', 'image/jpg'}
+    if doc.mime_type not in allowed_mimes:
+        await m.answer("❌ Поддерживаются только форматы JPEG и PNG.")
+        return
+    
+    # Проверяем расширение
+    if doc.file_name:
+        ext = doc.file_name.lower().split('.')[-1]
+        if ext not in {'jpg', 'jpeg', 'png'}:
+            await m.answer("❌ Поддерживаются только форматы JPEG и PNG.")
+            return
+    
+    try:
+        f = await m.bot.get_file(doc.file_id)
+        data = await m.bot.download_file(f.file_path)
+        if hasattr(data, 'read'):
+            data = data.read()
+    except Exception as e:
+        print(f"[wizard] document download error: {e}")
+        await m.answer("❌ Ошибка загрузки файла. Попробуйте ещё раз.")
+        return
+    
+    await state.update_data(avatar_state='added', avatar_bytes=data, step=2, avatar_upload_count=upload_count + 1)
+    await _render_card(m.bot, m.chat.id, state, None, _kb_final())
+    await m.answer("✅ Аватарка загружена!")
 
 
 @router.callback_query(StateFilter(CreateChannel.input_avatar), F.data == "cw:avatar:std")
 async def on_avatar_std(cq: CallbackQuery, state: FSMContext):
     print("[wizard] on_avatar_std")
+    # Проверяем, есть ли стандартная аватарка
+    contractor_id = cq.from_user.id
+    try:
+        profile = await profiles_service.get_avatar(contractor_id)
+        if not profile or not profile.get('std_avatar'):
+            # Нет стандартной аватарки — предлагаем загрузить
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📤 Загрузить в профиль", callback_data="profile:upload_avatar")],
+                [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="cw:avatar:skip")]
+            ])
+            await cq.message.edit_text(
+                "❌ Стандартная аватарка не найдена.\n\nЗагрузите её в 'Мой профиль' или пропустите этот шаг.",
+                reply_markup=kb
+            )
+            await cq.answer()
+            return
+    except Exception as e:
+        print(f"[wizard] error checking std avatar: {e}")
+        # При ошибке тоже предлагаем пропустить
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="cw:avatar:skip")]
+        ])
+        await cq.message.edit_text(
+            "❌ Не удалось проверить стандартную аватарку. Пропустите этот шаг.",
+            reply_markup=kb
+        )
+        await cq.answer()
+        return
+    
+    # Аватарка есть — используем её
     await state.update_data(avatar_state='std', avatar_bytes=None, step=2)
     await _render_card(cq.bot, cq.message.chat.id, state, None, _kb_final())
-    await cq.answer()
+    await cq.answer("✅ Используется стандартная аватарка")
+
 
 @router.callback_query(StateFilter(CreateChannel.input_avatar), F.data == "cw:avatar:skip")
 async def on_avatar_skip(cq: CallbackQuery, state: FSMContext):
@@ -194,10 +286,10 @@ async def on_avatar_skip(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-@router.message(StateFilter(CreateChannel.input_avatar), F.document)
-async def on_file_during_avatar(m: Message, state: FSMContext):
-    print("[wizard] on_file_during_avatar")
-    await m.answer("Сейчас можно загрузить только аватарку. Отправьте изображение фотографией или выберите ‘Пропустить’.")
+@router.callback_query(F.data == "profile:upload_avatar")
+async def on_profile_upload_avatar(cq: CallbackQuery, state: FSMContext):
+    """Перенаправляет в профиль для загрузки аватарки."""
+    await cq.answer("Перейдите в 'Мой профиль' → 'Загрузить аватарку'", show_alert=True)
 
 @router.callback_query(F.data == "cw:back")
 async def on_back(cq: CallbackQuery, state: FSMContext):
@@ -222,17 +314,7 @@ async def on_cancel(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
-@router.message(F.document)
-async def on_any_document(m: Message, state: FSMContext):
-    """Перехватываем документы во время шага аватарки, чтобы подсказать формат."""
-    st = await state.get_state()
-    try:
-        print(f"[wizard] catch-all document, state={st}")
-    except Exception:
-        pass
-    if st == CreateChannel.input_avatar.state:
-        return await on_file_during_avatar(m, state)
-    # Иначе — не наш сценарий
+
 
 
 
@@ -299,13 +381,15 @@ async def _execute_job(bot: Bot, user_id: int, d: dict) -> tuple[int | None, str
         channel_type=getattr(chat, 'type', None) if chat else None,
         avatar_file=avatar_tag,
     )
-    project = record.get('project') if record else None
+    channel_db = record.get('channel') if record else None
 
     try:
         link = await bot.create_chat_invite_link(chat_id=chat_id, name=f"Invite for {title}", member_limit=1)
         invite = link.invite_link
-        if project:
-            await projects_service.create_invite(project['id'], invite, allowed=1)
+        if channel_db:
+            # Извлекаем только токен из полной ссылки
+            token = invite.split('/')[-1] if '/' in invite else invite
+            await invites_service.create_invite(channel_id=int(channel_db['id']), token=token, max_uses=1)
     except Exception as e:
         invite = f"Не удалось создать ссылку: {e}"
 

@@ -116,7 +116,18 @@ async def act_new_channel(m: Message, state: FSMContext):
 
 @router.message(F.text.in_(CHANNELS_TRIGGERS))
 async def act_my_channels(m: Message, state: FSMContext):
-    await show_channels_overview(m, state)
+    # Создаем псевдо-CallbackQuery для совместимости с show_channels_overview
+    class PseudoCallbackQuery:
+        def __init__(self, message: Message):
+            self.message = message
+            self.from_user = message.from_user
+            self.data = None
+            
+        async def answer(self, text: str = None, show_alert: bool = False):
+            pass  # Не нужно отвечать на псевдо-callback
+    
+    pseudo_cq = PseudoCallbackQuery(m)
+    await show_channels_overview(pseudo_cq, state)
 
 
 @router.message(F.text == BTN_MY_LINKS)

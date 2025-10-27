@@ -10,7 +10,7 @@ celery = Celery(
     "smetabot-worker",
     broker=broker,
     backend=result_backend,
-    include=["tasks.render", "tasks.publish", "tasks.preview"],
+    include=["tasks.render", "tasks.publish", "tasks.preview", "tasks.stats"],
 )
 
 default_queue = os.getenv("CELERY_DEFAULT_QUEUE", "default")
@@ -52,12 +52,32 @@ celery.conf.update(
         "tasks.preview.generate_preview_task": {"queue": preview_queue},
         "tasks.publish.send_document": {"queue": publish_queue},
     },
+    beat_schedule={
+        "update-views-daily": {
+            "task": "tasks.stats.update_views_daily",
+            "schedule": 3600.0,  # Каждый час
+        },
+        "update-channel-stats": {
+            "task": "tasks.stats.update_channel_stats",
+            "schedule": 3600.0,  # Каждый час
+        },
+        "apply-queued-gifts": {
+            "task": "tasks.stats.apply_queued_gifts",
+            "schedule": 86400.0,  # Раз в день
+        },
+        "refresh-views-periodic": {
+            "task": "tasks.stats.refresh_views_periodic",
+            "schedule": 1800.0,  # Каждые 30 минут
+        },
+    },
+    timezone="UTC",
 )
 
 # Ensure tasks modules are imported so @shared_task registers.
 import tasks.render  # noqa: F401
 import tasks.publish  # noqa: F401
 import tasks.preview  # noqa: F401
+import tasks.stats  # noqa: F401
 
 from worker.metrics import setup_celery_signal_handlers  # noqa: E402
 

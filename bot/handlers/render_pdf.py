@@ -1120,7 +1120,9 @@ async def _fetch_recent_channels(contractor_id: str) -> List[Dict[str, Any]]:
         contractor_id_int = int(contractor_id or 0)
     channels = await channels_service.list_channels(contractor_id_int, limit=5)
     for item in channels:
-        rows.append({"channel_id": int(item["channel_id"]), "title": item["title"]})
+        # Используем tg_chat_id для публикации в воркере
+        chat_id = int(item.get("tg_chat_id") or item.get("channel_id", 0))
+        rows.append({"channel_id": chat_id, "title": item["title"]})
     return rows
 
 

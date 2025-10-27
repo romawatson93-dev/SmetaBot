@@ -1,18 +1,18 @@
 from typing import Optional
 from .db import fetchrow, fetch, execute, executemany, q
 
-# core.publications: id, channel_id, message_id, filename, file_type, caption, views, posted_at
+# core.publications: id, channel_id, message_id, file_name, file_type, views, posted_at, deleted
 
-async def add_publication(channel_id: int, message_id: int, filename: str, file_type: str, caption: Optional[str], views: int = 0) -> int:
+async def add_publication(channel_id: int, message_id: int, filename: str, file_type: str, views: int = 0) -> int:
     row = await fetchrow(
         f"""
-        INSERT INTO {q("publications")} (channel_id, message_id, filename, file_type, caption, views)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO {q("publications")} (channel_id, message_id, file_name, file_type, views)
+        VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (channel_id, message_id) DO UPDATE
-            SET filename = EXCLUDED.filename, file_type = EXCLUDED.file_type, caption = EXCLUDED.caption
+            SET file_name = EXCLUDED.file_name, file_type = EXCLUDED.file_type
         RETURNING id;
         """,
-        channel_id, message_id, filename, file_type, caption, views
+        channel_id, message_id, filename, file_type, views
     )
     return int(row["id"])
 

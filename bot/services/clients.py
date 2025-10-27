@@ -1,14 +1,16 @@
 from typing import Optional
 from .db import fetchrow, fetch, execute, q
 
-# core.clients: id, channel_id, invite_id, tg_id, full_name, username, blocked
+# core.clients: id, channel_id, invite_id, tg_user_id, username, full_name, joined_at, blocked
 
-async def register_client(channel_id: int, invite_id: int, tg_id: int, full_name: Optional[str], username: Optional[str]) -> int:
+async def register_client(channel_id: int, invite_id: Optional[int], tg_id: int, full_name: Optional[str], username: Optional[str]) -> int:
     row = await fetchrow(
         f"""
-        INSERT INTO {q("clients")} (channel_id, invite_id, tg_id, full_name, username, blocked)
-        VALUES ($1, $2, $3, $4, $5, FALSE)
-        ON CONFLICT DO NOTHING
+        INSERT INTO {q("clients")} (channel_id, invite_id, tg_user_id, full_name, username)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (channel_id, tg_user_id) DO UPDATE
+            SET username = COALESCE(EXCLUDED.username, {q("clients")}.username),
+                full_name = COALESCE(EXCLUDED.full_name, {q("clients")}.full_name)
         RETURNING id;
         """, channel_id, invite_id, tg_id, full_name, username
     )

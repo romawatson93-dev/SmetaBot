@@ -30,9 +30,9 @@ from bot.celery_client import get_celery
 
 from bot.services import channels as channels_service
 
-from bot.services import db as db_service
+from bot.services.db import db
 
-from bot.services import projects as projects_service
+from bot.services import contractors as contractors_service
 
 from aiogram import Bot, Dispatcher, F, Router
 
@@ -492,7 +492,7 @@ async def cb_newproj_quick(cq: CallbackQuery):
 
         if project:
 
-            await projects_service.create_invite(project["id"], link.invite_link, allowed=1)
+            await contractors_service.create_invite(project["id"], link.invite_link, allowed=1)
 
     except Exception as exc:
 
@@ -654,7 +654,7 @@ async def cb_invite(cq: CallbackQuery):
 
     if project_id is not None:
 
-        await projects_service.create_invite(project_id, link.invite_link, allowed=1)
+        await contractors_service.create_invite(project_id, link.invite_link, allowed=1)
 
 
 
@@ -698,7 +698,7 @@ async def on_join_request(evt: ChatJoinRequest):
 
 
 
-    invite = await projects_service.get_latest_invite(project_id)
+    invite = await contractors_service.get_latest_invite(project_id)
 
     if not invite:
 
@@ -716,7 +716,7 @@ async def on_join_request(evt: ChatJoinRequest):
 
         await bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
 
-        await projects_service.increment_invite_approved(invite["id"])
+        await contractors_service.increment_invite_approved(invite["id"])
 
     else:
 
@@ -892,7 +892,7 @@ async def create_channel_pipeline(msg: Message, title: str, avatar_bytes: bytes 
 
         if project:
 
-            await projects_service.create_invite(project["id"], link.invite_link, allowed=1)
+            await contractors_service.create_invite(project["id"], link.invite_link, allowed=1)
 
     except Exception as exc:
 
@@ -1079,13 +1079,17 @@ async def cb_stats(cq: CallbackQuery):
 
 async def main():
 
-    await db_service.init_pool()
-
+    await db.init_pool()
     print("Bot is up.")
-
     await bot.delete_webhook(drop_pending_updates=True)
-
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # корректно закрываем пул соединений с БД на выходе
+        try:
+           await db.close()
+        except Exception:
+            pass
 
 
 

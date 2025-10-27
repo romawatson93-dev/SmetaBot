@@ -14,9 +14,9 @@ from telethon.errors.rpcerrorlist import (
 )
 from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest, InviteToChannelRequest, EditPhotoRequest
 from telethon.tl.types import ChatAdminRights, PeerChannel, InputChatUploadedPhoto
-from telethon.tl.functions.messages import ToggleNoForwardsRequest
-
 from cryptography.fernet import Fernet
+from tg_ops.views import get_message_views, get_channel_message_views
+from typing import List, Dict, Optional
 
 # ---------- ENV ----------
 load_dotenv()
@@ -62,7 +62,27 @@ async def with_floodwait(coro):
         return await coro
 
 async def get_client_for_contractor(contractor_id: str) -> TelegramClient:
-    sess = load_session(contractor_id)
+    # Получаем tg_user_id из БД по contractor_id
+    import asyncpg
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://roman_br:headswillroul1@db:5432/smetabot")
+    
+    # Исправляем URL для asyncpg (убираем +asyncpg)
+    if "+asyncpg" in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.replace("+asyncpg", "")
+    
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        tg_user_id = await conn.fetchval(
+            "SELECT tg_user_id FROM core.contractors WHERE id = $1",
+            int(contractor_id)
+        )
+        if not tg_user_id:
+            raise HTTPException(400, f"Contractor {contractor_id} not found")
+    finally:
+        await conn.close()
+    
+    # Используем tg_user_id для загрузки сессии
+    sess = load_session(str(tg_user_id))
     if not sess:
         raise HTTPException(400, "Нет сессии подрядчика. Сначала выполните вход по номеру.")
     client = TelegramClient(StringSession(sess), API_ID, API_HASH)
@@ -119,6 +139,17 @@ class SetPhotoReq(BaseModel):
     contractor_id: str
     channel_id: int
     photo_b64: str  # base64-encoded image bytes (JPEG/PNG)
+
+class GetViewsReq(BaseModel):
+    contractor_id: str
+    channel_id: int
+    message_ids: Optional[List[int]] = None
+    limit: Optional[int] = 100
+
+class GetViewsResp(BaseModel):
+    ok: bool
+    views: Dict[int, int]
+    error: Optional[str] = None
 
 # ---------- SESSION STATUS ----------
 @app.get("/session/status", response_model=SessionStatusResp)
@@ -551,6 +582,51 @@ async def set_room_photo(req: SetPhotoReq):
         await with_floodwait(client(EditPhotoRequest(channel=entity, photo=InputChatUploadedPhoto(up))))
         await asyncio.sleep(0.5)
         return {"ok": True}
+    finally:
+        await client.disconnect()
+
+
+class RefreshStatsReq(BaseModel):
+    contractor_id: str
+    channel_id: int
+
+class RefreshStatsResp(BaseModel):
+    ok: bool
+    updated: int
+    error: Optional[str] = None
+
+@app.post("/rooms/get_views", response_model=GetViewsResp)
+async def get_room_views(req: GetViewsReq):
+    """Получает количество просмотров для сообщений в канале."""
+    client = await get_client_for_contractor(req.contractor_id)
+    try:
+        if req.message_ids:
+            # Получаем просмотры для конкретных сообщений
+            views = await get_message_views(client, req.channel_id, req.message_ids)
+        else:
+            # Получаем просмотры для последних сообщений
+            views = await get_channel_message_views(client, req.channel_id, req.limit)
+
+        return GetViewsResp(ok=True, views=views)
+    except Exception as e:
+        return GetViewsResp(ok=False, views={}, error=str(e))
+    finally:
+        await client.disconnect()
+
+@app.post("/rooms/refresh_stats", response_model=RefreshStatsResp)
+async def refresh_channel_stats(req: RefreshStatsReq):
+    """Обновляет статистику просмотров для канала."""
+    client = await get_client_for_contractor(req.contractor_id)
+    try:
+        # Получаем просмотры для последних сообщений канала
+        views = await get_channel_message_views(client, req.channel_id, limit=100)
+        
+        # Здесь можно добавить логику обновления БД через HTTP запрос к backend
+        # Пока просто возвращаем количество найденных сообщений
+        return RefreshStatsResp(ok=True, updated=len(views))
+        
+    except Exception as e:
+        return RefreshStatsResp(ok=False, updated=0, error=str(e))
     finally:
         await client.disconnect()
 

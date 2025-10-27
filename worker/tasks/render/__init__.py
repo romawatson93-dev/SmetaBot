@@ -132,24 +132,57 @@ async def _record_publication_async(
     message_payload: dict[str, object],
     source_document_id: int | None = None,
 ) -> None:
+    """Записывает публикацию в core.publications и событие в analytics.events."""
     await db_service.init_pool()
+    
+    # Прямой импорт для избежания циклических зависимостей
+    from bot.services.events import log_file_posted
+    
     document = message_payload.get("document") if isinstance(message_payload, dict) else None
-    await channels_service.record_channel_file(
-        channel_id=chat_id,
-        message_id=int(message_payload.get("message_id")),
-        filename=filename,
-        file_type=(document or {}).get("mime_type"),
-        caption=message_payload.get("caption"),
-        views=int(message_payload.get("views", 0) or 0),
-        posted_at=None,
-        source_document_id=source_document_id,
-    )
+    message_id = int(message_payload.get("message_id", 0))
+    
+    # Извлекаем mime_type
+    mime_type = None
+    if document and isinstance(document, dict):
+        mime_type_val = document.get("mime_type")
+        if isinstance(mime_type_val, str):
+            mime_type = mime_type_val
+    
+    # Записываем публикацию
+    try:
+        print(f"DEBUG: filename={filename}, mime_type={mime_type}, message_payload keys={list(message_payload.keys()) if message_payload else None}")
+        publication_id = await channels_service.record_channel_file(
+            channel_id=chat_id,
+            message_id=message_id,
+            filename=filename,
+            file_type=mime_type,
+            views=int(message_payload.get("views", 0) or 0),
+        )
+        
+        # Получаем БД ID канала для события
+        channel_db = await db_service.fetchrow(
+            "SELECT id FROM core.channels WHERE tg_chat_id = $1",
+            chat_id
+        )
+        
+        if channel_db:
+            channel_db_id = channel_db["id"]
+            # Записываем событие в analytics.events
+            await log_file_posted(
+                channel_id=channel_db_id,
+                message_id=message_id,
+                file_name=filename,
+                file_type=mime_type or "unknown",
+            )
+    except Exception as exc:
+        print(f"Failed to record publication: {exc}")
 
 
 def _record_publication(chat_id: int, filename: str, message_payload: dict[str, object] | None, source_document_id: int | None = None) -> None:
     if not message_payload:
         return
     try:
+        import asyncio
         asyncio.run(_record_publication_async(chat_id, filename, message_payload, source_document_id))
     except Exception as exc:  # pragma: no cover - best effort
         print("Failed to record publication metadata:", exc)
