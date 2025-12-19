@@ -407,7 +407,7 @@ async def get_channel_publications(channel_db_id: int, limit: int = 50) -> list[
     """Возвращает список публикаций канала с просмотрами."""
     rows = await fetch(
         """
-        SELECT id, file_name, file_type, views, posted_at
+        SELECT id, message_id, file_name, file_type, views, posted_at
         FROM core.publications
         WHERE channel_id = $1 AND deleted = false
         ORDER BY posted_at DESC

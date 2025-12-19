@@ -1,10 +1,14 @@
 import os, asyncio, secrets
-from typing import Optional, Dict, Any
+import json
+import logging
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -12,8 +16,9 @@ from telethon.errors import FloodWaitError
 from telethon.errors.rpcerrorlist import (
     SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError
 )
+from telethon.tl.functions.messages import ToggleNoForwardsRequest
 from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest, InviteToChannelRequest, EditPhotoRequest
-from telethon.tl.types import ChatAdminRights, PeerChannel, InputChatUploadedPhoto
+from telethon.tl.types import ChatAdminRights, PeerChannel, InputChatUploadedPhoto, ChannelParticipantsAdmins
 from cryptography.fernet import Fernet
 from tg_ops.views import get_message_views, get_channel_message_views
 from typing import List, Dict, Optional
@@ -50,9 +55,18 @@ def save_session(contractor_id: str, session_string: str) -> None:
 
 def load_session(contractor_id: str) -> Optional[str]:
     p = session_path(contractor_id)
-    if not os.path.exists(p): return None
-    with open(p, "rb") as f: data = f.read()
-    return _dec(data)
+    logger.debug(f"Loading session from path: {p}")
+    if not os.path.exists(p):
+        logger.warning(f"Session file not found: {p}")
+        return None
+    try:
+        with open(p, "rb") as f: data = f.read()
+        sess = _dec(data)
+        logger.debug(f"Session loaded successfully for contractor_id={contractor_id}")
+        return sess
+    except Exception as e:
+        logger.error(f"Error decrypting session for contractor_id={contractor_id}: {type(e).__name__}: {str(e)}")
+        return None
 
 async def with_floodwait(coro):
     try:
@@ -62,33 +76,20 @@ async def with_floodwait(coro):
         return await coro
 
 async def get_client_for_contractor(contractor_id: str) -> TelegramClient:
-    # Получаем tg_user_id из БД по contractor_id
-    import asyncpg
-    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://roman_br:headswillroul1@db:5432/smetabot")
-    
-    # Исправляем URL для asyncpg (убираем +asyncpg)
-    if "+asyncpg" in DATABASE_URL:
-        DATABASE_URL = DATABASE_URL.replace("+asyncpg", "")
-    
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        tg_user_id = await conn.fetchval(
-            "SELECT tg_user_id FROM core.contractors WHERE id = $1",
-            int(contractor_id)
-        )
-        if not tg_user_id:
-            raise HTTPException(400, f"Contractor {contractor_id} not found")
-    finally:
-        await conn.close()
-    
-    # Используем tg_user_id для загрузки сессии
-    sess = load_session(str(tg_user_id))
+    # contractor_id - это Telegram user ID (как и в /session/status и при сохранении сессий)
+    # Загружаем сессию напрямую по Telegram user ID
+    logger.info(f"Loading session for contractor_id={contractor_id}")
+    sess = load_session(contractor_id)
     if not sess:
+        logger.warning(f"Session not found for contractor_id={contractor_id}")
         raise HTTPException(400, "Нет сессии подрядчика. Сначала выполните вход по номеру.")
+    logger.info(f"Session loaded for contractor_id={contractor_id}, connecting...")
     client = TelegramClient(StringSession(sess), API_ID, API_HASH)
     await client.connect()
     if not await client.is_user_authorized():
+        logger.warning(f"Session not authorized for contractor_id={contractor_id}")
         raise HTTPException(401, "Сессия больше не авторизована")
+    logger.info(f"Client connected and authorized for contractor_id={contractor_id}")
     return client
 
 # ---------- APP ----------
@@ -151,6 +152,20 @@ class GetViewsResp(BaseModel):
     views: Dict[int, int]
     error: Optional[str] = None
 
+class GetAdminsReq(BaseModel):
+    contractor_id: str
+    channel_id: int
+    limit: Optional[int] = 50
+
+class AdminInfo(BaseModel):
+    id: int
+    username: Optional[str] = None
+    full_name: Optional[str] = None
+
+class GetAdminsResp(BaseModel):
+    ok: bool
+    admins: List[AdminInfo] = []
+    error: Optional[str] = None
 # ---------- SESSION STATUS ----------
 @app.get("/session/status", response_model=SessionStatusResp)
 async def session_status(contractor_id: str, verify: bool = False):
@@ -502,8 +517,18 @@ checkSession();
 # ---------- ROOMS ----------
 @app.post("/rooms/create", response_model=CreateRoomResp)
 async def create_room(req: CreateRoomReq):
-    client = await get_client_for_contractor(req.contractor_id)
+    logger.info(f"Creating room for contractor_id={req.contractor_id}, title={req.title}")
     try:
+        client = await get_client_for_contractor(req.contractor_id)
+    except HTTPException as e:
+        logger.error(f"HTTPException in get_client_for_contractor: {e.status_code} - {e.detail}")
+        raise e
+    except Exception as e:
+        logger.error(f"Exception in get_client_for_contractor: {type(e).__name__}: {str(e)}")
+        raise HTTPException(400, f"Ошибка получения клиента: {str(e)}")
+    
+    try:
+        logger.info(f"Creating channel with title: {req.title}")
         r = await with_floodwait(client(CreateChannelRequest(
             title=req.title,
             about=req.about or "",
@@ -511,10 +536,16 @@ async def create_room(req: CreateRoomReq):
             for_import=False
         )))
         ch = r.chats[0]
+        logger.info(f"Channel created with id={ch.id}")
         await asyncio.sleep(1.5)
+        logger.info(f"Enabling no forwards for channel id={ch.id}")
         await with_floodwait(client(ToggleNoForwardsRequest(peer=ch, enabled=True)))
         await asyncio.sleep(1.0)
+        logger.info(f"Room creation completed, channel_id={ch.id}")
         return CreateRoomResp(channel_id=ch.id)
+    except Exception as e:
+        logger.error(f"Exception in create_room: {type(e).__name__}: {str(e)}", exc_info=True)
+        raise HTTPException(400, f"Ошибка создания канала: {str(e)}")
     finally:
         await client.disconnect()
 
@@ -627,6 +658,35 @@ async def refresh_channel_stats(req: RefreshStatsReq):
         
     except Exception as e:
         return RefreshStatsResp(ok=False, updated=0, error=str(e))
+    finally:
+        await client.disconnect()
+
+
+@app.post("/rooms/get_admins", response_model=GetAdminsResp)
+async def get_room_admins(req: GetAdminsReq):
+    """Возвращает список администраторов канала."""
+    client = await get_client_for_contractor(req.contractor_id)
+    try:
+        entity = await client.get_entity(PeerChannel(int(req.channel_id)))
+        participants = await client.get_participants(
+            entity,
+            filter=ChannelParticipantsAdmins(),
+            limit=req.limit or 50,
+        )
+        admins: List[AdminInfo] = []
+        for user in participants:
+            if not getattr(user, "bot", False):
+                full_name = " ".join(filter(None, [user.first_name, user.last_name])) or None
+                admins.append(
+                    AdminInfo(
+                        id=user.id,
+                        username=user.username,
+                        full_name=full_name,
+                    )
+                )
+        return GetAdminsResp(ok=True, admins=admins)
+    except Exception as e:
+        return GetAdminsResp(ok=False, admins=[], error=str(e))
     finally:
         await client.disconnect()
 

@@ -1,0 +1,1199 @@
+# 📋 SmetaBot — Техническое задание для разработчика
+
+## 🎯 Назначение документа
+
+Данный документ содержит полное техническое задание для разработки системы SmetaBot — автоматизированной платформы для защищённой выдачи смет подрядчиков клиентам через Telegram.
+
+**Целевая аудитория:** Разработчики, которые будут реализовывать или дорабатывать функционал системы.
+
+---
+
+## 📑 Содержание
+
+1. [Общее описание системы](#1-общее-описание-системы)
+2. [Архитектура компонентов](#2-архитектура-компонентов)
+3. [Детальный User Flow от /start](#3-детальный-user-flow-от-start)
+4. [Описание логики работы](#4-описание-логики-работы)
+5. [Требования к реализации](#5-требования-к-реализации)
+6. [API и интеграции](#6-api-и-интеграции)
+7. [База данных](#7-база-данных)
+8. [Безопасность](#8-безопасность)
+
+---
+
+## 1. Общее описание системы
+
+### 1.1. Что делает система
+
+SmetaBot — это Telegram-бот, который позволяет подрядчикам:
+- Создавать приватные защищённые каналы для проектов
+- Загружать документы (PDF, DOC, XLS) и автоматически конвертировать их в PNG с водяным знаком
+- Публиковать документы в каналах с защитой от копирования
+- Создавать одноразовые ссылки-приглашения для клиентов
+- Отслеживать статистику просмотров и активность
+
+### 1.2. Ключевые особенности
+
+- **Защита контента**: Все публикации с флагом `protect_content=True`, запрещён форвардинг
+- **Автоматическая конвертация**: PDF/DOC/XLS → PNG 300 DPI с водяным знаком
+- **Многопользовательская архитектура**: Отдельная MTProto-сессия для каждого подрядчика
+- **Асинхронная обработка**: Celery workers для фоновых задач
+
+---
+
+## 2. Архитектура компонентов
+
+### 2.1. Основные сервисы
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    КОМПОНЕНТЫ СИСТЕМЫ                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
+│  │ Telegram Bot │  │  Userbot API │  │ Backend API  │      │
+│  │  (aiogram)   │  │  (FastAPI +  │  │  (FastAPI)   │      │
+│  │              │  │   Telethon)  │  │              │      │
+│  │  - Handlers  │  │  - Sessions  │  │  - Health    │      │
+│  │  - Services  │  │  - Channels  │  │  - WebApp    │      │
+│  │  - FSM       │  │  - Login     │  │              │      │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘      │
+│         │                  │                  │              │
+│         │ HTTP             │ MTProto          │ HTTP         │
+│         │                  │                  │              │
+│  ┌──────▼──────────────────▼──────────────────▼───────┐    │
+│  │              Celery Workers                         │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐       │    │
+│  │  │ Worker   │  │ Worker   │  │ Worker   │       │    │
+│  │  │ PDF      │  │ Office   │  │ Publish  │       │    │
+│  │  │          │  │          │  │          │       │    │
+│  │  │ PDF→PNG  │  │ DOC→PNG  │  │ Send to  │       │    │
+│  │  │          │  │ XLS→PNG  │  │ Channel  │       │    │
+│  │  └──────────┘  └──────────┘  └──────────┘       │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │    Redis     │  │  PostgreSQL  │  │ File System  │    │
+│  │              │  │              │  │              │    │
+│  │  - Queues    │  │  - core.*    │  │  - Sessions  │    │
+│  │  - Cache     │  │  - billing.* │  │    (.enc)    │    │
+│  │  - Temp files│  │  - analytics.*│ │              │    │
+│  └──────────────┘  └──────────────┘  └──────────────┘    │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 2.2. Взаимодействие компонентов
+
+1. **Telegram Bot** получает команды от пользователей
+2. **Userbot API** выполняет операции с Telegram через MTProto
+3. **Celery Workers** обрабатывают документы в фоне
+4. **PostgreSQL** хранит метаданные
+5. **Redis** используется для очередей и временных файлов
+
+---
+
+## 3. Детальный User Flow от /start
+
+### 3.1. Полная схема потока от команды /start
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ЭТАП 1: СТАРТ БОТА                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Пользователь: /start                                          │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                         │  │
+│  │  Handler: bot/handlers/menu.py::cmd_start               │  │
+│  │                                                           │  │
+│  │  1. Извлечь contractor_id = str(message.from_user.id)   │  │
+│  │  2. Проверить сессию:                                    │  │
+│  │     GET /session/status?contractor_id={id}               │  │
+│  │  3. Проверить init_ok в FSM state                       │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Userbot API]                                           │  │
+│  │  Endpoint: GET /session/status                          │  │
+│  │                                                           │  │
+│  │  1. Проверить файл: {contractor_id}.session.enc         │  │
+│  │  2. Если файл есть:                                      │  │
+│  │     - Расшифровать Fernet(SESSION_SECRET)                │  │
+│  │     - Загрузить StringSession                            │  │
+│  │     - Проверить авторизацию (опционально verify=true)    │  │
+│  │  3. Вернуть: {has_session: bool, authorized: bool}       │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │                                                           │  │
+│  │  Условие: REQUIRE_INIT_DATA && !init_ok                  │  │
+│  │  ┌───────────────────────────────────────────────────┐  │  │
+│  │  │  Если TRUE:                                        │  │  │
+│  │  │  - Показать кнопку "Открыть вход (WebApp)"        │  │  │
+│  │  │  - Ожидать авторизации через WebApp                │  │  │
+│  │  │  - Выход из обработчика                             │  │  │
+│  │  └───────────────────────────────────────────────────┘  │  │
+│  │                                                           │  │
+│  │  Условие: has_session                                     │  │
+│  │  ┌───────────────────────────────────────────────────┐  │  │
+│  │  │  Если FALSE:                                        │  │  │
+│  │  │  - Показать главное меню с заблокированными        │  │  │
+│  │  │    функциями (требуется авторизация)                 │  │  │
+│  │  │                                                      │  │  │
+│  │  │  Если TRUE:                                         │  │  │
+│  │  │  - Показать главное меню с разблокированными        │  │  │
+│  │  │    функциями                                        │  │  │
+│  │  └───────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2. Главное меню
+
+После успешного `/start` пользователь видит меню:
+
+```
+┌─────────────────────────────────────┐
+│            ГЛАВНОЕ МЕНЮ             │
+├─────────────────────────────────────┤
+│                                     │
+│  🆕 Новый канал                     │
+│  📢 Мои каналы                      │
+│  🔗 Мои ссылки                      │
+│  📄 Рендер файлов                   │
+│  👤 Личный кабинет                  │
+│  ❓ Помощь                          │
+│                                     │
+└─────────────────────────────────────┘
+```
+
+**Обработчики:**
+- `🆕 Новый канал` → `bot/handlers/channel_wizard.py::start_wizard`
+- `📢 Мои каналы` → `bot/handlers/my_channels.py::show_channels_overview`
+- `📄 Рендер файлов` → `bot/handlers/menu.py::act_render_menu`
+- Остальные — заглушки или в разработке
+
+### 3.3. Сценарий: Авторизация через WebApp
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│          ЭТАП 2: АВТОРИЗАЦИЯ (если сессии нет)                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Пользователь нажимает "Открыть вход (WebApp)"                │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [WebApp]                                               │  │
+│  │  URL: {WEBAPP_URL}/webapp/login                         │  │
+│  │                                                           │  │
+│  │  1. Проверить сессию:                                    │  │
+│  │     GET /session/status?contractor_id={id}&verify=true  │  │
+│  │                                                           │  │
+│  │  2. Если сессии нет:                                     │  │
+│  │     - Показать форму ввода телефона                     │  │
+│  │     - POST /login/phone/start {contractor_id, phone}    │  │
+│  │     - Получить token                                     │  │
+│  │                                                           │  │
+│  │  3. Показать форму ввода кода                            │  │
+│  │     - POST /login/phone/confirm {token, code}           │  │
+│  │     - Если 2FA: запросить пароль                        │  │
+│  │     - POST /login/phone/2fa {token, password}           │  │
+│  │                                                           │  │
+│  │  4. После успеха:                                        │  │
+│  │     - tg.sendData({action: "session_ready"})            │  │
+│  │     - Закрыть WebApp                                     │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Handler: bot/handlers/webapp_gate.py                   │  │
+│  │                                                           │  │
+│  │  1. Получить web_app_data                                │  │
+│  │  2. Парсить JSON: {action: "session_ready"}              │  │
+│  │  3. Обновить FSM: state.update_data(init_ok=True)       │  │
+│  │  4. Повторно проверить сессию:                            │  │
+│  │     GET /session/status?contractor_id={id}&verify=true    │  │
+│  │  5. Показать главное меню с разблокированными функциями │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3.4. Сценарий: Создание канала
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│          ЭТАП 3: СОЗДАНИЕ КАНАЛА                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Пользователь: "🆕 Новый канал"                                │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                         │  │
+│  │  Handler: channel_wizard.py::start_wizard              │  │
+│  │                                                           │  │
+│  │  1. Проверить сессию: has_session(contractor_id)       │  │
+│  │  2. Если нет сессии:                                     │  │
+│  │     - В dev: показать кнопку "☎️ Подключить по телефону"│  │
+│  │     - В prod: сообщение "Подтвердите сессию через Mini App"│ │
+│  │     - Выход                                              │  │
+│  │                                                           │  │
+│  │  3. Очистить FSM state                                   │  │
+│  │  4. Установить FSM state: CreateChannel.input_title      │  │
+│  │  5. Показать чек-лист:                                   │  │
+│  │     "▫️ 1) Название: не задано"                         │  │
+│  │     "▫️ 2) Аватарка: не выбрано"                        │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Пользователь вводит название канала                     │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Handler: channel_wizard.py::on_title                   │  │
+│  │                                                           │  │
+│  │  1. Валидация: title.strip()[:64]                        │  │
+│  │  2. Обновить FSM: state.update_data(title=title)         │  │
+│  │  3. Установить FSM state: CreateChannel.input_avatar     │  │
+│  │  4. Обновить чек-лист:                                   │  │
+│  │     "✅ 1) Название: {title}"                            │  │
+│  │     "▫️ 2) Аватарка: не выбрано"                         │  │
+│  │  5. Показать кнопки:                                     │  │
+│  │     - "⭐ Установить стандартную"                        │  │
+│  │     - "⏭️ Пропустить"                                   │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Пользователь выбирает аватарку:                        │  │
+│  │  - Загружает фото → on_avatar_photo                     │  │
+│  │  - "Стандартная" → callback cw:avatar:std               │  │
+│  │  - "Пропустить" → callback cw:avatar:skip               │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Обновить чек-лист:                                      │  │
+│  │  "✅ 1) Название: {title}"                               │  │
+│  │  "✅ 2) Аватарка: {статус}"                             │  │
+│  │  Показать кнопку "Продолжить"                           │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Пользователь нажимает "Продолжить"                      │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Handler: channel_wizard.py::on_final                    │  │
+│  │                                                           │  │
+│  │  1. Проверить лимиты:                                    │  │
+│  │     billing.can_create_channel(contractor_id)            │  │
+│  │                                                           │  │
+│  │  2. Создать канал через Userbot:                         │  │
+│  │     POST /rooms/create {                                │  │
+│  │       contractor_id: str,                                │  │
+│  │       title: str,                                        │  │
+│  │       about: str (опционально)                           │  │
+│  │     }                                                     │  │
+│  │                                                           │  │
+│  │  3. Назначить бота администратором:                      │  │
+│  │     POST /rooms/add_bot_admin {                         │  │
+│  │       contractor_id: str,                                │  │
+│  │       channel_id: int,                                   │  │
+│  │       bot_username: str                                  │  │
+│  │     }                                                     │  │
+│  │                                                           │  │
+│  │  4. Установить фото (если загружено):                    │  │
+│  │     - Через Bot API: set_chat_photo()                    │  │
+│  │     - Или через Userbot: POST /rooms/set_photo          │  │
+│  │                                                           │  │
+│  │  5. Сохранить в БД:                                      │  │
+│  │     channels_service.create_project_channel(...)        │  │
+│  │                                                           │  │
+│  │  6. Создать одноразовую ссылку:                          │  │
+│  │     bot.create_chat_invite_link(                        │  │
+│  │       chat_id=channel_id,                                │  │
+│  │       member_limit=1,                                    │  │
+│  │       creates_join_request=True                          │  │
+│  │     )                                                     │  │
+│  │                                                           │  │
+│  │  7. Сохранить инвайт в БД:                               │  │
+│  │     invites_service.create_invite(...)                    │  │
+│  │                                                           │  │
+│  │  8. Показать результат:                                  │  │
+│  │     "✅ Канал создан!"                                   │  │
+│  │     "Ссылка: {invite_link}"                              │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 3.5. Сценарий: Загрузка и публикация документа
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│          ЭТАП 4: РЕНДЕР И ПУБЛИКАЦИЯ ДОКУМЕНТА                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Пользователь: "📄 Рендер файлов"                             │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Handler: menu.py::act_render_menu                       │  │
+│  │                                                           │  │
+│  │  Показать меню форматов:                                 │  │
+│  │  - "📄 PDF → PNG"                                        │  │
+│  │  - "📊 Excel → PNG"                                      │  │
+│  │  - "📝 Word → PNG"                                       │  │
+│  │  - "🖼️ PNG в канал"                                      │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Пользователь выбирает формат (например, "📄 PDF → PNG") │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Handler: render_pdf.py::wait_for_pdf                    │  │
+│  │                                                           │  │
+│  │  Установить FSM state: RenderPDF.waiting_pdf             │  │
+│  │  Сообщение: "Отправьте PDF файл"                         │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Пользователь отправляет PDF файл                        │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Handler: render_pdf.py::on_pdf_received                 │  │
+│  │                                                           │  │
+│  │  1. Скачать файл: bot.get_file()                         │  │
+│  │  2. Сохранить в Redis:                                    │  │
+│  │     SET pdf:{uuid} [file_bytes] EX {TTL}                 │  │
+│  │  3. Поставить задачу превью:                             │  │
+│  │     generate_preview_task.delay(uuid, "pdf")              │  │
+│  │  4. Сообщение: "Генерирую превью..."                     │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Celery Worker Preview]                                 │  │
+│  │  Task: generate_preview_task                            │  │
+│  │                                                           │  │
+│  │  1. GET pdf:{uuid} из Redis                             │  │
+│  │  2. PyMuPDF: PDF → PNG (300 DPI)                         │  │
+│  │  3. Pillow: PNG → JPEG thumbnail (1600px)                 │  │
+│  │  4. SET preview:{uuid} [thumbnail] EX {TTL}             │  │
+│  │  5. Вернуть результат в бот                              │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Показать превью пользователю:                           │  │
+│  │  - Список страниц с кнопками выбора                      │  │
+│  │  - Поле ввода водяного знака (по умолчанию username)    │  │
+│  │  - Кнопка "Опубликовать"                                 │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Пользователь:                                            │  │
+│  │  - Выбирает страницы [1, 3, 5]                          │  │
+│  │  - Вводит водяной знак: "Иванов И.И."                    │  │
+│  │  - Нажимает "Опубликовать"                               │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Telegram Bot]                                          │  │
+│  │  Поставить задачу рендеринга:                            │  │
+│  │  process_and_publish_pdf.delay(                          │  │
+│  │    uuid, pages=[1,3,5], watermark="Иванов И.И.",        │  │
+│  │    channel_id, contractor_id                            │  │
+│  │  )                                                        │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Celery Worker PDF]                                     │  │
+│  │  Task: process_and_publish_pdf                           │  │
+│  │                                                           │  │
+│  │  1. GET pdf:{uuid} из Redis                              │  │
+│  │  2. DEL pdf:{uuid} (однократное чтение)                  │  │
+│  │  3. PyMuPDF: PDF → PNG 300 DPI для страниц [1,3,5]      │  │
+│  │  4. Для каждой страницы:                                 │  │
+│  │     - apply_tiled_watermark(png, "Иванов И.И.")          │  │
+│  │     - SET renderpng:{uuid}-{page} [watermarked_png]      │  │
+│  │  5. Поставить задачи публикации:                          │  │
+│  │     send_document.delay(                                  │  │
+│  │       channel_id, renderpng:{uuid}-{page}, filename       │  │
+│  │     )                                                     │  │
+│  └───────┬─────────────────────────────────────────────────┘  │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  [Celery Worker Publish]                                 │  │
+│  │  Task: send_document                                     │  │
+│  │                                                           │  │
+│  │  1. GET renderpng:{uuid}-{page} из Redis                │  │
+│  │  2. Telegram Bot API:                                   │  │
+│  │     sendDocument(                                        │  │
+│  │       chat_id=channel_id,                                │  │
+│  │       document=renderpng_bytes,                          │  │
+│  │       filename="smeta-page-01.png",                      │  │
+│  │       protect_content=True  ← ЗАЩИТА                     │  │
+│  │     )                                                     │  │
+│  │  3. Получить message_id от Telegram                       │  │
+│  │  4. Сохранить в БД:                                       │  │
+│  │     INSERT INTO core.channel_files (                     │  │
+│  │       channel_id, message_id, file_name, views=0         │  │
+│  │     )                                                     │  │
+│  │  5. DELETE renderpng:{uuid}-{page} из Redis              │  │
+│  │  6. Уведомить пользователя: "✅ Опубликовано"            │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Описание логики работы
+
+### 4.1. Логика обработки команды /start
+
+**Файл:** `bot/handlers/menu.py`
+
+**Функция:** `cmd_start`
+
+**Алгоритм:**
+
+1. **Извлечение данных пользователя:**
+   ```python
+   contractor_id = str(m.from_user.id)
+   ```
+
+2. **Проверка сессии:**
+   ```python
+   try:
+       sess = await userbot_get("/session/status", {"contractor_id": contractor_id})
+       has = bool(sess.get("has_session"))
+   except Exception:
+       has = False
+   ```
+   - Выполняется HTTP GET запрос к Userbot API
+   - Если запрос успешен и `has_session == true`, сессия существует
+   - При ошибке считаем, что сессии нет
+
+3. **Проверка авторизации через WebApp:**
+   ```python
+   init_ok = bool((await state.get_data()).get("init_ok"))
+   if REQUIRE_INIT_DATA and not init_ok:
+       await m.answer("Для продолжения авторизуйтесь через WebApp:", reply_markup=webapp_kb())
+       return
+   ```
+   - В production (`REQUIRE_INIT_DATA=true`) требуется авторизация через WebApp
+   - Если `init_ok` не установлен, показываем кнопку WebApp
+
+4. **Отображение главного меню:**
+   ```python
+   await _ensure_main_menu(m, state, has)
+   ```
+   - Функция проверяет, есть ли уже сообщение с меню (`menu_mid`)
+   - Если есть — редактирует его
+   - Если нет — создаёт новое сообщение
+   - Меню одинаковое независимо от `has_session` (блокировка на уровне обработчиков)
+
+### 4.2. Логика авторизации через WebApp
+
+**Файл:** `bot/handlers/webapp_gate.py`
+
+**Функция:** `mark_init_from_webapp`
+
+**Алгоритм:**
+
+1. **Получение данных из WebApp:**
+   ```python
+   raw = message.web_app_data.data
+   payload = json.loads(raw)
+   ```
+
+2. **Проверка действия:**
+   ```python
+   if payload.get("action") == "session_ready":
+       await state.update_data(init_ok=True)
+   ```
+   - WebApp отправляет `{action: "session_ready"}` после успешной авторизации
+   - Устанавливаем флаг `init_ok` в FSM state
+
+**Файл:** `userbot/api.py`
+
+**Эндпоинт:** `POST /login/phone/start`
+
+**Алгоритм:**
+
+1. **Создание TelegramClient:**
+   ```python
+   client = TelegramClient(StringSession(), API_ID, API_HASH)
+   await client.connect()
+   ```
+
+2. **Запуск телефонного логина:**
+   ```python
+   await client.send_code_request(phone)
+   ```
+   - Отправляется код в Telegram/SMS
+   - Сохраняется `_pending_phone[token] = {client, phone}`
+
+3. **Возврат token:**
+   ```json
+   {"token": "random_token_here"}
+   ```
+
+**Эндпоинт:** `POST /login/phone/confirm`
+
+**Алгоритм:**
+
+1. **Получение клиента из pending:**
+   ```python
+   pending = _pending_phone.get(token)
+   client = pending["client"]
+   ```
+
+2. **Подтверждение кода:**
+   ```python
+   me = await client.sign_in(code=code)
+   ```
+   - Если требуется 2FA, возвращается `{status: "2fa_required"}`
+   - Если успешно, возвращается `{status: "ready", me: {...}}`
+
+3. **Сохранение сессии:**
+   ```python
+   session_string = client.session.save()
+   encrypted = fernet.encrypt(session_string.encode())
+   with open(f"{SESSIONS_DIR}/{contractor_id}.session.enc", "wb") as f:
+       f.write(encrypted)
+   ```
+
+### 4.3. Логика создания канала
+
+**Файл:** `bot/handlers/channel_wizard.py`
+
+**Функция:** `start_wizard`
+
+**Алгоритм:**
+
+1. **Проверка сессии:**
+   ```python
+   if not await has_session(contractor_id):
+       # Показать сообщение об ошибке
+       return
+   ```
+
+2. **Инициализация FSM:**
+   ```python
+   await state.clear()
+   await state.update_data(
+       step=1,
+       title=None,
+       avatar_state=None,
+       avatar_bytes=None,
+       card_mid=None
+   )
+   await state.set_state(CreateChannel.input_title)
+   ```
+
+3. **Отображение чек-листа:**
+   ```python
+   await _render_card(bot, chat_id, state, hint, keyboard)
+   ```
+   - Создаётся сообщение с чек-листом
+   - `card_mid` сохраняется в state для последующего обновления
+
+**Функция:** `on_final` (callback `cw:final3`)
+
+**Алгоритм:**
+
+1. **Проверка готовности:**
+   ```python
+   data = await state.get_data()
+   if not _is_ready(data):
+       return  # Не готово
+   ```
+
+2. **Создание канала через Userbot:**
+   ```python
+   result = await userbot_post("/rooms/create", {
+       "contractor_id": contractor_id,
+       "title": data["title"],
+       "about": ""  # опционально
+   })
+   channel_id = result["channel_id"]
+   ```
+
+3. **Назначение бота администратором:**
+   ```python
+   await userbot_post("/rooms/add_bot_admin", {
+       "contractor_id": contractor_id,
+       "channel_id": channel_id,
+       "bot_username": BOT_USERNAME
+   })
+   ```
+
+4. **Установка фото (если есть):**
+   ```python
+   if data.get("avatar_bytes"):
+       # Через Bot API или Userbot API
+       await bot.set_chat_photo(channel_id, BufferedInputFile(...))
+   ```
+
+5. **Сохранение в БД:**
+   ```python
+   await channels_service.create_project_channel(
+       contractor_id=contractor_id,
+       tg_chat_id=channel_id,
+       title=data["title"]
+   )
+   ```
+
+6. **Создание инвайта:**
+   ```python
+   invite_link = await bot.create_chat_invite_link(
+       chat_id=channel_id,
+       member_limit=1,
+       creates_join_request=True
+   )
+   await invites_service.create_invite(channel_id, invite_link.invite_link)
+   ```
+
+### 4.4. Логика обработки документов
+
+**Файл:** `bot/handlers/render_pdf.py`
+
+**Функция:** `on_pdf_received`
+
+**Алгоритм:**
+
+1. **Скачивание файла:**
+   ```python
+   file = await bot.get_file(document.file_id)
+   file_bytes = await bot.download_file(file.file_path)
+   ```
+
+2. **Сохранение в Redis:**
+   ```python
+   uuid = str(uuid4())
+   await redis.setex(
+       f"pdf:{uuid}",
+       SOURCE_BLOB_TTL,  # 24 часа
+       file_bytes
+   )
+   ```
+
+3. **Постановка задачи превью:**
+   ```python
+   from worker.tasks.preview import generate_preview_task
+   generate_preview_task.delay(uuid, "pdf")
+   ```
+
+**Файл:** `worker/tasks/render/__init__.py`
+
+**Функция:** `process_and_publish_pdf`
+
+**Алгоритм:**
+
+1. **Извлечение файла:**
+   ```python
+   pdf_bytes = await redis.get(f"pdf:{uuid}")
+   await redis.delete(f"pdf:{uuid}")  # Однократное чтение
+   ```
+
+2. **Конвертация в PNG:**
+   ```python
+   import fitz  # PyMuPDF
+   doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+   for page_num in pages:
+       page = doc[page_num - 1]  # 0-indexed
+       mat = fitz.Matrix(300/72, 300/72)  # 300 DPI
+       pix = page.get_pixmap(matrix=mat)
+       png_bytes = pix.tobytes("png")
+   ```
+
+3. **Наложение водяного знака:**
+   ```python
+   from worker.tasks.watermark import apply_tiled_watermark
+   watermarked_png = apply_tiled_watermark(png_bytes, watermark_text)
+   ```
+
+4. **Сохранение результата:**
+   ```python
+   await redis.setex(
+       f"renderpng:{uuid}-{page_num}",
+       FULLRES_BLOB_TTL,  # 12 часов
+       watermarked_png
+   )
+   ```
+
+5. **Постановка задач публикации:**
+   ```python
+   from worker.tasks.publish import send_document
+   for page_num in pages:
+       send_document.delay(
+           channel_id=channel_id,
+           document_key=f"renderpng:{uuid}-{page_num}",
+           filename=f"smeta-page-{page_num:02d}.png",
+           caption=""
+       )
+   ```
+
+**Файл:** `worker/tasks/publish.py`
+
+**Функция:** `send_document`
+
+**Алгоритм:**
+
+1. **Получение документа:**
+   ```python
+   document_bytes = await redis.get(document_key)
+   ```
+
+2. **Отправка через Bot API:**
+   ```python
+   from aiogram import Bot
+   bot = Bot(token=BOT_TOKEN)
+   message = await bot.send_document(
+       chat_id=channel_id,
+       document=BufferedInputFile(document_bytes, filename),
+       caption=caption,
+       protect_content=True  # ЗАЩИТА
+   )
+   ```
+
+3. **Сохранение в БД:**
+   ```python
+   await channels_service.record_channel_file(
+       channel_id=channel_id,
+       message_id=message.message_id,
+       file_name=filename,
+       file_type="image/png"
+   )
+   ```
+
+4. **Очистка:**
+   ```python
+   await redis.delete(document_key)
+   ```
+
+---
+
+## 5. Требования к реализации
+
+### 5.1. Обработка команды /start
+
+**Требования:**
+
+1. ✅ Проверять наличие сессии через Userbot API
+2. ✅ В production требовать авторизацию через WebApp (`REQUIRE_INIT_DATA=true`)
+3. ✅ В dev разрешать телефонный логин без WebApp
+4. ✅ Показывать главное меню независимо от статуса сессии
+5. ✅ Блокировать функции, требующие сессии, на уровне обработчиков
+
+**Реализация:**
+
+```python
+@router.message(Command("start"))
+async def cmd_start(m: Message, state: FSMContext):
+    contractor_id = str(m.from_user.id)
+    try:
+        sess = await userbot_get("/session/status", {"contractor_id": contractor_id})
+        has = bool(sess.get("has_session"))
+    except Exception:
+        has = False
+    init_ok = bool((await state.get_data()).get("init_ok"))
+    if REQUIRE_INIT_DATA and not init_ok:
+        await m.answer("Для продолжения авторизуйтесь через WebApp:", reply_markup=webapp_kb())
+        return
+    await _ensure_main_menu(m, state, has)
+```
+
+### 5.2. Авторизация через WebApp
+
+**Требования:**
+
+1. ✅ WebApp должен проверять существующую сессию
+2. ✅ Если сессии нет — запускать телефонный flow
+3. ✅ Поддерживать 2FA (двухфакторную аутентификацию)
+4. ✅ После успеха отправлять `session_ready` в бот
+5. ✅ Бот должен обновлять `init_ok` и проверять сессию повторно
+
+**Реализация WebApp (псевдокод):**
+
+```javascript
+// Проверка сессии
+const response = await fetch(`/session/status?contractor_id=${contractorId}&verify=true`);
+const { has_session, authorized } = await response.json();
+
+if (!has_session || !authorized) {
+    // Запуск телефонного логина
+    const startResponse = await fetch('/login/phone/start', {
+        method: 'POST',
+        body: JSON.stringify({ contractor_id: contractorId, phone: phone })
+    });
+    const { token } = await startResponse.json();
+    
+    // Ввод кода
+    const confirmResponse = await fetch('/login/phone/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ token, code })
+    });
+    const { status } = await confirmResponse.json();
+    
+    if (status === '2fa_required') {
+        // Ввод пароля 2FA
+        const twofaResponse = await fetch('/login/phone/2fa', {
+            method: 'POST',
+            body: JSON.stringify({ token, password })
+        });
+    }
+    
+    // Отправка в бот
+    window.Telegram.WebApp.sendData(JSON.stringify({ action: 'session_ready' }));
+}
+```
+
+### 5.3. Создание канала
+
+**Требования:**
+
+1. ✅ Проверять наличие сессии перед началом
+2. ✅ Использовать FSM для многошагового процесса
+3. ✅ Валидировать название (макс. 64 символа)
+4. ✅ Поддерживать три варианта аватарки: кастом, стандартная, пропустить
+5. ✅ Проверять лимиты подписки перед созданием
+6. ✅ Создавать канал с `ToggleNoForwardsRequest`
+7. ✅ Назначать бота администратором с правами: post_messages, invite_users
+8. ✅ Сохранять метаданные в БД
+9. ✅ Создавать одноразовую ссылку-приглашение
+
+**Реализация:**
+
+См. раздел 4.3 "Логика создания канала"
+
+### 5.4. Обработка документов
+
+**Требования:**
+
+1. ✅ Сохранять файлы в Redis с TTL
+2. ✅ Генерировать превью для PDF/DOC/XLS
+3. ✅ Позволять пользователю выбирать страницы
+4. ✅ Поддерживать настройку водяного знака
+5. ✅ Конвертировать в PNG 300 DPI
+6. ✅ Накладывать тайловый водяной знак
+7. ✅ Публиковать с `protect_content=True`
+8. ✅ Сохранять метаданные в БД
+9. ✅ Удалять временные файлы после обработки
+
+**Реализация:**
+
+См. раздел 4.4 "Логика обработки документов"
+
+---
+
+## 6. API и интеграции
+
+### 6.1. Userbot API
+
+**Базовый URL:** `http://userbot:8001` (внутренний) или `https://orbitsend.ru` (внешний)
+
+#### GET /session/status
+
+**Параметры:**
+- `contractor_id` (str, обязательный)
+- `verify` (bool, опционально) — реконнект для проверки
+
+**Ответ:**
+```json
+{
+  "has_session": true,
+  "authorized": true
+}
+```
+
+#### POST /rooms/create
+
+**Тело:**
+```json
+{
+  "contractor_id": "123456789",
+  "title": "Проект Иванова",
+  "about": "Описание проекта"
+}
+```
+
+**Ответ:**
+```json
+{
+  "channel_id": -1001234567890
+}
+```
+
+**Логика:**
+1. Загрузить сессию: `{contractor_id}.session.enc`
+2. Расшифровать Fernet
+3. Создать TelegramClient
+4. Вызвать `CreateChannelRequest(title, about)`
+5. Вызвать `ToggleNoForwardsRequest(enabled=True)`
+6. Вернуть `channel_id`
+
+#### POST /rooms/add_bot_admin
+
+**Тело:**
+```json
+{
+  "contractor_id": "123456789",
+  "channel_id": -1001234567890,
+  "bot_username": "@smetabot"
+}
+```
+
+**Ответ:**
+```json
+{
+  "ok": true
+}
+```
+
+**Логика:**
+1. Загрузить сессию
+2. Создать TelegramClient
+3. Вызвать `EditAdminRequest` с правами:
+   - `post_messages=True`
+   - `invite_users=True`
+   - `change_info=True`
+   - Остальные `False`
+
+### 6.2. Celery Tasks
+
+#### generate_preview_task
+
+**Очередь:** `preview`
+
+**Параметры:**
+- `file_uuid` (str)
+- `file_type` (str): "pdf", "doc", "xls"
+
+**Логика:**
+1. GET файл из Redis: `{file_type}:{uuid}`
+2. Конвертировать в PNG (PyMuPDF/LibreOffice)
+3. Создать thumbnail JPEG 1600px (Pillow)
+4. SET превью в Redis: `preview:{uuid}` с TTL
+5. Вернуть результат в бот
+
+#### process_and_publish_pdf
+
+**Очередь:** `pdf`
+
+**Параметры:**
+- `file_uuid` (str)
+- `pages` (List[int])
+- `watermark_text` (str)
+- `channel_id` (int)
+- `contractor_id` (str)
+
+**Логика:**
+1. GET и DEL файл из Redis (однократное чтение)
+2. Конвертировать страницы в PNG 300 DPI
+3. Наложить водяной знак
+4. Сохранить в Redis: `renderpng:{uuid}-{page}`
+5. Поставить задачи `send_document` для каждой страницы
+
+#### send_document
+
+**Очередь:** `publish`
+
+**Параметры:**
+- `channel_id` (int)
+- `document_key` (str): ключ в Redis
+- `filename` (str)
+- `caption` (str)
+
+**Логика:**
+1. GET документ из Redis
+2. Отправить через Bot API с `protect_content=True`
+3. Сохранить в БД: `core.channel_files`
+4. DELETE документ из Redis
+
+---
+
+## 7. База данных
+
+### 7.1. Основные таблицы
+
+#### core.contractors
+
+```sql
+CREATE TABLE core.contractors (
+    id BIGSERIAL PRIMARY KEY,
+    tg_user_id BIGINT UNIQUE NOT NULL,
+    username TEXT,
+    full_name TEXT,
+    status TEXT CHECK (status IN ('active', 'blocked')),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+#### core.channels
+
+```sql
+CREATE TABLE core.channels (
+    id BIGSERIAL PRIMARY KEY,
+    contractor_id BIGINT NOT NULL REFERENCES core.contractors(id),
+    tg_chat_id BIGINT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    username TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    created_by_bot BOOLEAN DEFAULT true,
+    synced BOOLEAN DEFAULT false,
+    last_synced_at TIMESTAMPTZ
+);
+```
+
+#### core.channel_files
+
+```sql
+CREATE TABLE core.channel_files (
+    id BIGSERIAL PRIMARY KEY,
+    channel_id BIGINT NOT NULL REFERENCES core.channels(id),
+    message_id BIGINT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    views INTEGER DEFAULT 0,
+    posted_at TIMESTAMPTZ DEFAULT NOW(),
+    deleted BOOLEAN DEFAULT false,
+    UNIQUE (channel_id, message_id)
+);
+```
+
+#### core.project_invites
+
+```sql
+CREATE TABLE core.project_invites (
+    id BIGSERIAL PRIMARY KEY,
+    channel_id BIGINT NOT NULL REFERENCES core.channels(id),
+    token TEXT UNIQUE NOT NULL,
+    expires_at TIMESTAMPTZ,
+    max_uses INTEGER,
+    used_count INTEGER DEFAULT 0,
+    editable BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 7.2. Индексы
+
+```sql
+CREATE INDEX idx_channels_contractor ON core.channels(contractor_id);
+CREATE INDEX idx_channel_files_channel_posted ON core.channel_files(channel_id, posted_at DESC);
+CREATE INDEX idx_project_invites_channel ON core.project_invites(channel_id);
+```
+
+---
+
+## 8. Безопасность
+
+### 8.1. Защита контента
+
+1. **Telegram-каналы:**
+   - Все каналы создаются с `ToggleNoForwardsRequest(enabled=True)`
+   - Все публикации с `protect_content=True`
+   - Файлы публикуются только как `document` (не фото/видео)
+
+2. **Водяные знаки:**
+   - Тайловое наложение на все изображения
+   - Настройки: opacity, step, angle, color, font
+   - Текст по умолчанию: username подрядчика
+
+### 8.2. Управление сессиями
+
+1. **Шифрование:**
+   - Сессии шифруются Fernet перед сохранением
+   - Ключ: `SESSION_SECRET` из переменных окружения
+   - Формат файла: `{contractor_id}.session.enc`
+
+2. **Изоляция:**
+   - Отдельная сессия для каждого подрядчика
+   - Сессии не пересекаются
+   - Автоматическое закрытие клиентов после операций
+
+### 8.3. Инвайты
+
+1. **Ограничения:**
+   - Одноразовые ссылки: `member_limit=1`
+   - TTL: `expires_at` (опционально)
+   - Лимит использований: `max_uses` (опционально)
+
+2. **Join-requests:**
+   - Все инвайты с `creates_join_request=True`
+   - Требуется одобрение подрядчиком или ботом
+   - Автоматическая проверка лимитов
+
+---
+
+## 📝 Примечания для разработчика
+
+### Важные моменты:
+
+1. **FSM State Management:**
+   - Всегда очищайте state перед началом нового процесса
+   - Сохраняйте промежуточные данные в `state.update_data()`
+   - Используйте `state.set_state()` для перехода между этапами
+
+2. **Обработка ошибок:**
+   - Всегда оборачивайте HTTP-запросы в try/except
+   - Логируйте ошибки без чувствительных данных
+   - Показывайте пользователю понятные сообщения
+
+3. **Redis TTL:**
+   - Исходные файлы: `SOURCE_BLOB_TTL` (24 часа)
+   - Превью: `PREVIEW_BLOB_TTL` (1 час)
+   - Готовые PNG: `FULLRES_BLOB_TTL` (12 часов)
+
+4. **Celery Tasks:**
+   - Используйте правильные очереди: `pdf`, `office`, `publish`, `preview`
+   - Удаляйте файлы из Redis после обработки
+   - Обрабатывайте retry при ошибках Telegram API
+
+5. **Telegram API:**
+   - Всегда используйте `protect_content=True` при публикации
+   - Обрабатывайте FloodWait через `with_floodwait`
+   - Retry при ошибках 403, 429, 400
+
+---
+
+**Версия документа:** 1.0  
+**Дата создания:** 2024  
+**Последнее обновление:** 2024
+

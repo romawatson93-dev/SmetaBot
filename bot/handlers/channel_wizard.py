@@ -24,6 +24,13 @@ USERBOT_URL = os.getenv("USERBOT_URL", "http://userbot:8001")
 async def userbot_post(path: str, json=None):
     async with httpx.AsyncClient(timeout=60) as cl:
         r = await cl.post(f"{USERBOT_URL}{path}", json=json or {})
+        if r.status_code >= 400:
+            error_detail = "Unknown error"
+            try:
+                error_detail = r.text[:500] if r.text else "No response body"
+            except Exception:
+                pass
+            print(f"[userbot_post] Error {r.status_code} for {path}: {error_detail}")
         r.raise_for_status()
         return r.json()
 
